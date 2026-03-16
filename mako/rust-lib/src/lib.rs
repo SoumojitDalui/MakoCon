@@ -14,6 +14,7 @@ use resp3_handler::Resp3Handler;
 
 const TXN_OP_GET: u32 = 1;
 const TXN_OP_SET: u32 = 2;
+const TXN_OP_DEL: u32 = 3;
 
 #[repr(C)]
 struct TxnOperation {
@@ -64,6 +65,7 @@ enum OpCode {
     Multi   = 4,
     Exec    = 5,
     Discard = 6,
+    Del     = 7,
 }
 
 #[derive(Clone)]
@@ -124,6 +126,7 @@ fn ascii_eq_ci(a: &[u8], b: &[u8]) -> bool {
 fn parse_opcode(name: &[u8]) -> OpCode {
     if ascii_eq_ci(name, b"GET") { OpCode::Get }
     else if ascii_eq_ci(name, b"SET") { OpCode::Set }
+    else if ascii_eq_ci(name, b"DEL") { OpCode::Del }
     else if ascii_eq_ci(name, b"PING") { OpCode::Ping }
     else if ascii_eq_ci(name, b"MULTI") { OpCode::Multi }
     else if ascii_eq_ci(name, b"EXEC") { OpCode::Exec }
@@ -147,7 +150,7 @@ fn parse_resp3(frame: DecodedFrame<BytesFrame>) -> Option<Command> {
 
     let op = parse_opcode(name);
     match op {
-        OpCode::Get => {
+        OpCode::Get | OpCode::Del => {
             if parts.len() < 2 { return None; }
             let key = match &parts[1] {
                 BlobString { data, .. } | SimpleString { data, .. } => Bytes::copy_from_slice(data),
@@ -235,6 +238,7 @@ fn build_txn_ops(commands: &[Command]) -> Vec<TxnOperation> {
             op: match cmd.op {
                 OpCode::Get => TXN_OP_GET,
                 OpCode::Set => TXN_OP_SET,
+                OpCode::Del => TXN_OP_DEL,
                 _ => 0, // Should not happen - filtered before
             },
             key_ptr: cmd.key.as_ptr(),
@@ -280,6 +284,13 @@ fn ffi_execute_single<W: Write>(cmd: &Command, writer: &mut W) -> std::io::Resul
         } else {
             write_nil_bulk(writer)?;
         }
+    } else if cmd.op == OpCode::Del {
+        // DEL returns integer: number of keys deleted (1 if existed, 0 if not)
+        let count = if result.data_len > 0 { 1u64 } else { 0u64 };
+        let mut buf = itoa::Buffer::new();
+        writer.write_all(b":")?;
+        writer.write_all(buf.format(count).as_bytes())?;
+        writer.write_all(b"\r\n")?;
     } else {
         // SET returns OK
         write_simple_ok(writer)?;
@@ -336,6 +347,12 @@ fn ffi_execute_transaction<W: Write>(commands: &[Command], writer: &mut W) -> st
             } else {
                 write_nil_bulk(writer)?;
             }
+        } else if cmd.op == OpCode::Del {
+            let count = if result.data_len > 0 { 1u64 } else { 0u64 };
+            let mut buf = itoa::Buffer::new();
+            writer.write_all(b":")?;
+            writer.write_all(buf.format(count).as_bytes())?;
+            writer.write_all(b"\r\n")?;
         } else {
             // SET returns OK
             write_simple_ok(writer)?;
@@ -491,7 +508,7 @@ fn handle_command<W: Write>(
                 write_simple_ok(writer)?;
             }
         }
-        OpCode::Get | OpCode::Set => {
+        OpCode::Get | OpCode::Set | OpCode::Del => {
             if txn_state.in_multi {
                 // Queue command for later execution
                 txn_state.queue_command(cmd.clone());
