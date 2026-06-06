@@ -1,6 +1,8 @@
 use bytes::BytesMut;
-use redis_protocol::resp3::{decode::streaming::decode_bytes_mut, types::BytesFrame, types::DecodedFrame};
 use redis_protocol::error::RedisProtocolError;
+use redis_protocol::resp3::{
+    decode::streaming::decode_bytes_mut, types::BytesFrame, types::DecodedFrame,
+};
 
 /// BytesFrame from redis_protocol: an enum type that includes all RESP3 types:
 // pub enum BytesFrame {
@@ -22,7 +24,6 @@ use redis_protocol::error::RedisProtocolError;
 //     ChunkedString(Bytes),
 // }
 
-
 /// Handler that buffers incoming bytes and parses complete RESP3 frames.
 pub struct Resp3Handler {
     buf: BytesMut,
@@ -31,7 +32,9 @@ pub struct Resp3Handler {
 impl Resp3Handler {
     /// Create a new handler with a buffer of given capacity.
     pub fn new(capacity: usize) -> Self {
-        Self { buf: BytesMut::with_capacity(capacity) }
+        Self {
+            buf: BytesMut::with_capacity(capacity),
+        }
     }
 
     pub fn print_buffer(&self) {
@@ -51,14 +54,13 @@ impl Resp3Handler {
     /// - Clears the buffer and return Ok(None) if an error was raised during parsing.
     pub fn next_frame(&mut self) -> Result<Option<DecodedFrame<BytesFrame>>, RedisProtocolError> {
         match decode_bytes_mut(&mut self.buf) {
-            Ok(Some((frame, _consumed, _leftover))) => {
-                Ok(Some(frame))
-            }
-            Ok(None) => {
-                Ok(None)
-            }
+            Ok(Some((frame, _consumed, _leftover))) => Ok(Some(frame)),
+            Ok(None) => Ok(None),
             Err(e) => {
-                eprintln!("Parse error: {} ---- the message below will be garbage collected", e);
+                eprintln!(
+                    "Parse error: {} ---- the message below will be garbage collected",
+                    e
+                );
                 eprintln!("XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX");
                 self.print_buffer();
                 eprintln!("XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX");

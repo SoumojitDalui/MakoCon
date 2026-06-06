@@ -2,7 +2,7 @@ use bytes::Bytes;
 use redis_protocol::resp3::{types::BytesFrame, types::DecodedFrame};
 use socket2::{Domain, Protocol, Socket, Type};
 use std::env;
-use std::io::{BufWriter, Read, Write};
+use std::io::{ErrorKind, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -13,6 +13,7 @@ use resp3_handler::Resp3Handler;
 
 static CONNECTED_CLIENTS: AtomicUsize = AtomicUsize::new(0);
 static TOTAL_CONNECTIONS_RECEIVED: AtomicUsize = AtomicUsize::new(0);
+static NEXT_CLIENT_ID: AtomicUsize = AtomicUsize::new(1);
 
 // ===== FFI Types (must match transaction_ffi.h) =====
 
@@ -20,6 +21,17 @@ const TXN_OP_GET: u32 = 1;
 const TXN_OP_SET: u32 = 2;
 const TXN_OP_DEL: u32 = 3;
 const TXN_OP_EXISTS: u32 = 4;
+const TXN_OP_APPEND: u32 = 5;
+const TXN_OP_STRLEN: u32 = 6;
+const TXN_OP_INCRBY: u32 = 7;
+const TXN_OP_INCRBYFLOAT: u32 = 8;
+
+const TXN_FLAG_SET_NX: u32 = 1 << 0;
+const TXN_FLAG_SET_XX: u32 = 1 << 1;
+const TXN_FLAG_SET_RETURN_OLD: u32 = 1 << 2;
+const TXN_FLAG_SET_INTEGER_REPLY: u32 = 1 << 3;
+const TXN_FLAG_SET_REQUIRE_ABSENT_GROUP: u32 = 1 << 4;
+const TXN_FLAG_SET_KEEP_TTL: u32 = 1 << 5;
 
 #[repr(C)]
 struct TxnOperation {
@@ -28,6 +40,9 @@ struct TxnOperation {
     key_len: usize,
     val_ptr: *const u8,
     val_len: usize,
+    flags: u32,
+    expire_at_ms: i64,
+    group_id: u32,
 }
 
 #[repr(C)]
@@ -42,6 +57,7 @@ struct TxnOpResult {
     value_present: bool,
     data_ptr: *mut u8,
     data_len: usize,
+    int_value: i64,
 }
 
 #[repr(C)]
@@ -68,6 +84,7 @@ extern "C" {
     fn cpp_execute_transaction(request: *const TxnRequest, response: *mut TxnResponse) -> bool;
     fn cpp_free_transaction_response(response: *mut TxnResponse);
     fn cpp_get_metrics(metrics: *mut MakoMetrics) -> bool;
+    fn cpp_record_txn_retry();
 }
 
 #[cfg(test)]
@@ -96,6 +113,9 @@ unsafe fn cpp_get_metrics(metrics: *mut MakoMetrics) -> bool {
     true
 }
 
+#[cfg(test)]
+unsafe fn cpp_record_txn_retry() {}
+
 // ===== OpCode and Command =====
 
 #[derive(Copy, Clone, PartialEq)]
@@ -118,6 +138,26 @@ enum OpCode {
     Echo = 15,
     Info = 16,
     Exists = 17,
+    MGet = 18,
+    MSet = 19,
+    MSetNx = 20,
+    GetSet = 21,
+    SetNx = 22,
+    Append = 23,
+    StrLen = 24,
+    Incr = 25,
+    IncrBy = 26,
+    Decr = 27,
+    DecrBy = 28,
+    IncrByFloat = 29,
+    Config = 30,
+}
+
+#[derive(Copy, Clone, PartialEq)]
+enum SetCondition {
+    None,
+    Nx,
+    Xx,
 }
 
 #[derive(Clone)]
@@ -125,7 +165,30 @@ struct Command {
     op: OpCode,
     keys: Vec<Bytes>,
     val: Option<Bytes>,
+    values: Vec<Bytes>,
     args: Vec<Bytes>,
+    set_condition: SetCondition,
+    set_return_old: bool,
+    set_integer_reply: bool,
+    set_keep_ttl: bool,
+    expire_at_ms: i64,
+}
+
+impl Command {
+    fn new(op: OpCode, keys: Vec<Bytes>, val: Option<Bytes>, args: Vec<Bytes>) -> Self {
+        Command {
+            op,
+            keys,
+            val,
+            values: Vec::new(),
+            args,
+            set_condition: SetCondition::None,
+            set_return_old: false,
+            set_integer_reply: false,
+            set_keep_ttl: false,
+            expire_at_ms: -1,
+        }
+    }
 }
 
 enum ParseError {
@@ -174,6 +237,7 @@ impl TransactionState {
 
 /// Per-connection client metadata for Redis handshake commands.
 struct ClientState {
+    id: usize,
     protocol_version: u8,
     name: Option<Bytes>,
     close_after_reply: bool,
@@ -182,6 +246,7 @@ struct ClientState {
 impl ClientState {
     fn new() -> Self {
         ClientState {
+            id: NEXT_CLIENT_ID.fetch_add(1, Ordering::Relaxed),
             protocol_version: 2,
             name: None,
             close_after_reply: false,
@@ -216,6 +281,30 @@ fn parse_opcode(name: &[u8]) -> Option<OpCode> {
         Some(OpCode::Get)
     } else if ascii_eq_ci(name, b"SET") {
         Some(OpCode::Set)
+    } else if ascii_eq_ci(name, b"MGET") {
+        Some(OpCode::MGet)
+    } else if ascii_eq_ci(name, b"MSET") {
+        Some(OpCode::MSet)
+    } else if ascii_eq_ci(name, b"MSETNX") {
+        Some(OpCode::MSetNx)
+    } else if ascii_eq_ci(name, b"GETSET") {
+        Some(OpCode::GetSet)
+    } else if ascii_eq_ci(name, b"SETNX") {
+        Some(OpCode::SetNx)
+    } else if ascii_eq_ci(name, b"APPEND") {
+        Some(OpCode::Append)
+    } else if ascii_eq_ci(name, b"STRLEN") {
+        Some(OpCode::StrLen)
+    } else if ascii_eq_ci(name, b"INCR") {
+        Some(OpCode::Incr)
+    } else if ascii_eq_ci(name, b"INCRBY") {
+        Some(OpCode::IncrBy)
+    } else if ascii_eq_ci(name, b"DECR") {
+        Some(OpCode::Decr)
+    } else if ascii_eq_ci(name, b"DECRBY") {
+        Some(OpCode::DecrBy)
+    } else if ascii_eq_ci(name, b"INCRBYFLOAT") {
+        Some(OpCode::IncrByFloat)
     } else if ascii_eq_ci(name, b"DEL") {
         Some(OpCode::Del)
     } else if ascii_eq_ci(name, b"UNLINK") {
@@ -248,6 +337,8 @@ fn parse_opcode(name: &[u8]) -> Option<OpCode> {
         Some(OpCode::Echo)
     } else if ascii_eq_ci(name, b"INFO") {
         Some(OpCode::Info)
+    } else if ascii_eq_ci(name, b"CONFIG") {
+        Some(OpCode::Config)
     } else {
         None
     }
@@ -272,6 +363,38 @@ fn command_args(parts: &[BytesFrame]) -> Option<Vec<Bytes>> {
 
 fn wrong_arity(command: &'static str) -> ParseError {
     ParseError::WrongArity { command }
+}
+
+fn part_to_bytes(part: &BytesFrame) -> Result<Bytes, ParseError> {
+    match part {
+        BytesFrame::BlobString { data, .. } | BytesFrame::SimpleString { data, .. } => {
+            Ok(Bytes::copy_from_slice(data))
+        }
+        _ => Err(ParseError::Protocol("invalid argument")),
+    }
+}
+
+fn ttl_ms_from_args(unit: &[u8], value: &[u8]) -> Result<i64, ParseError> {
+    let text = std::str::from_utf8(value).map_err(|_| ParseError::Protocol("invalid argument"))?;
+    let amount: i64 = text
+        .parse()
+        .map_err(|_| ParseError::Protocol("invalid argument"))?;
+    if amount <= 0 {
+        return Err(ParseError::Protocol("invalid argument"));
+    }
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|_| ParseError::Protocol("invalid argument"))?
+        .as_millis() as i64;
+    if ascii_eq_ci(unit, b"EX") {
+        Ok(now_ms + amount * 1000)
+    } else if ascii_eq_ci(unit, b"PX") {
+        Ok(now_ms + amount)
+    } else if ascii_eq_ci(unit, b"EXAT") {
+        Ok(amount * 1000)
+    } else {
+        Ok(amount)
+    }
 }
 
 /// Parse RESP3 frame into Command
@@ -303,16 +426,28 @@ fn parse_resp3(frame: DecodedFrame<BytesFrame>) -> Result<Command, ParseError> {
             if parts.len() != 2 {
                 return Err(wrong_arity("get"));
             }
-            let key = match &parts[1] {
-                BlobString { data, .. } | SimpleString { data, .. } => Bytes::copy_from_slice(data),
-                _ => return Err(ParseError::Protocol("invalid argument")),
-            };
-            Ok(Command {
+            let key = part_to_bytes(&parts[1])?;
+            Ok(Command::new(
                 op,
-                keys: vec![key],
-                val: None,
-                args: command_args(&parts).ok_or(ParseError::Protocol("invalid argument"))?,
-            })
+                vec![key],
+                None,
+                command_args(&parts).ok_or(ParseError::Protocol("invalid argument"))?,
+            ))
+        }
+        OpCode::MGet => {
+            if parts.len() < 2 {
+                return Err(wrong_arity("mget"));
+            }
+            let mut keys = Vec::with_capacity(parts.len() - 1);
+            for part in parts.iter().skip(1) {
+                keys.push(part_to_bytes(part)?);
+            }
+            Ok(Command::new(
+                op,
+                keys,
+                None,
+                command_args(&parts).ok_or(ParseError::Protocol("invalid argument"))?,
+            ))
         }
         OpCode::Del | OpCode::Exists => {
             if parts.len() < 2 {
@@ -324,39 +459,162 @@ fn parse_resp3(frame: DecodedFrame<BytesFrame>) -> Result<Command, ParseError> {
             }
             let mut keys = Vec::with_capacity(parts.len() - 1);
             for part in parts.iter().skip(1) {
-                let key = match part {
-                    BlobString { data, .. } | SimpleString { data, .. } => {
-                        Bytes::copy_from_slice(data)
-                    }
-                    _ => return Err(ParseError::Protocol("invalid argument")),
-                };
-                keys.push(key);
+                keys.push(part_to_bytes(part)?);
             }
-            Ok(Command {
+            Ok(Command::new(
                 op,
                 keys,
-                val: None,
-                args: command_args(&parts).ok_or(ParseError::Protocol("invalid argument"))?,
-            })
+                None,
+                command_args(&parts).ok_or(ParseError::Protocol("invalid argument"))?,
+            ))
         }
         OpCode::Set => {
-            if parts.len() != 3 {
+            if parts.len() < 3 {
                 return Err(wrong_arity("set"));
             }
-            let key = match &parts[1] {
-                BlobString { data, .. } | SimpleString { data, .. } => Bytes::copy_from_slice(data),
-                _ => return Err(ParseError::Protocol("invalid argument")),
-            };
-            let val = match &parts[2] {
-                BlobString { data, .. } | SimpleString { data, .. } => Bytes::copy_from_slice(data),
-                _ => return Err(ParseError::Protocol("invalid argument")),
-            };
-            Ok(Command {
+            let key = part_to_bytes(&parts[1])?;
+            let val = part_to_bytes(&parts[2])?;
+            let mut cmd = Command::new(
                 op,
-                keys: vec![key],
-                val: Some(val),
-                args: command_args(&parts).ok_or(ParseError::Protocol("invalid argument"))?,
-            })
+                vec![key],
+                Some(val),
+                command_args(&parts).ok_or(ParseError::Protocol("invalid argument"))?,
+            );
+            let mut index = 3;
+            let mut saw_expiry = false;
+            while index < parts.len() {
+                let arg = part_to_bytes(&parts[index])?;
+                if ascii_eq_ci(arg.as_ref(), b"NX") {
+                    if cmd.set_condition != SetCondition::None {
+                        return Err(ParseError::Protocol("syntax error"));
+                    }
+                    cmd.set_condition = SetCondition::Nx;
+                    index += 1;
+                } else if ascii_eq_ci(arg.as_ref(), b"XX") {
+                    if cmd.set_condition != SetCondition::None {
+                        return Err(ParseError::Protocol("syntax error"));
+                    }
+                    cmd.set_condition = SetCondition::Xx;
+                    index += 1;
+                } else if ascii_eq_ci(arg.as_ref(), b"GET") {
+                    cmd.set_return_old = true;
+                    index += 1;
+                } else if ascii_eq_ci(arg.as_ref(), b"KEEPTTL") {
+                    if saw_expiry {
+                        return Err(ParseError::Protocol("syntax error"));
+                    }
+                    cmd.set_keep_ttl = true;
+                    index += 1;
+                } else if ascii_eq_ci(arg.as_ref(), b"EX")
+                    || ascii_eq_ci(arg.as_ref(), b"PX")
+                    || ascii_eq_ci(arg.as_ref(), b"EXAT")
+                    || ascii_eq_ci(arg.as_ref(), b"PXAT")
+                {
+                    if index + 1 >= parts.len() {
+                        return Err(ParseError::Protocol("syntax error"));
+                    }
+                    let ttl = part_to_bytes(&parts[index + 1])?;
+                    cmd.expire_at_ms = ttl_ms_from_args(arg.as_ref(), ttl.as_ref())?;
+                    if cmd.set_keep_ttl || saw_expiry {
+                        return Err(ParseError::Protocol("syntax error"));
+                    }
+                    saw_expiry = true;
+                    index += 2;
+                } else {
+                    return Err(ParseError::Protocol("syntax error"));
+                }
+            }
+            Ok(cmd)
+        }
+        OpCode::MSet | OpCode::MSetNx => {
+            if parts.len() < 3 || parts.len() % 2 == 0 {
+                return Err(wrong_arity(if op == OpCode::MSet {
+                    "mset"
+                } else {
+                    "msetnx"
+                }));
+            }
+            let mut keys = Vec::with_capacity((parts.len() - 1) / 2);
+            let mut values = Vec::with_capacity((parts.len() - 1) / 2);
+            for pair in parts[1..].chunks_exact(2) {
+                keys.push(part_to_bytes(&pair[0])?);
+                values.push(part_to_bytes(&pair[1])?);
+            }
+            let mut cmd = Command::new(
+                op,
+                keys,
+                None,
+                command_args(&parts).ok_or(ParseError::Protocol("invalid argument"))?,
+            );
+            cmd.values = values;
+            Ok(cmd)
+        }
+        OpCode::GetSet
+        | OpCode::SetNx
+        | OpCode::Append
+        | OpCode::IncrBy
+        | OpCode::DecrBy
+        | OpCode::IncrByFloat => {
+            if parts.len() != 3 {
+                return Err(wrong_arity(match op {
+                    OpCode::GetSet => "getset",
+                    OpCode::SetNx => "setnx",
+                    OpCode::Append => "append",
+                    OpCode::IncrBy => "incrby",
+                    OpCode::DecrBy => "decrby",
+                    OpCode::IncrByFloat => "incrbyfloat",
+                    _ => "command",
+                }));
+            }
+            let key = part_to_bytes(&parts[1])?;
+            let mut val = part_to_bytes(&parts[2])?;
+            if op == OpCode::DecrBy {
+                let text = std::str::from_utf8(val.as_ref())
+                    .map_err(|_| ParseError::Protocol("invalid argument"))?;
+                let amount: i64 = text
+                    .parse()
+                    .map_err(|_| ParseError::Protocol("invalid argument"))?;
+                let negated = amount.checked_neg().ok_or(ParseError::Protocol(
+                    "increment or decrement would overflow",
+                ))?;
+                val = Bytes::from(negated.to_string());
+            }
+            let mut cmd = Command::new(
+                op,
+                vec![key],
+                Some(val),
+                command_args(&parts).ok_or(ParseError::Protocol("invalid argument"))?,
+            );
+            if op == OpCode::GetSet {
+                cmd.set_return_old = true;
+            } else if op == OpCode::SetNx {
+                cmd.set_condition = SetCondition::Nx;
+                cmd.set_integer_reply = true;
+            }
+            Ok(cmd)
+        }
+        OpCode::StrLen | OpCode::Incr | OpCode::Decr => {
+            if parts.len() != 2 {
+                return Err(wrong_arity(match op {
+                    OpCode::StrLen => "strlen",
+                    OpCode::Incr => "incr",
+                    OpCode::Decr => "decr",
+                    _ => "command",
+                }));
+            }
+            let key = part_to_bytes(&parts[1])?;
+            let mut cmd = Command::new(
+                op,
+                vec![key],
+                None,
+                command_args(&parts).ok_or(ParseError::Protocol("invalid argument"))?,
+            );
+            if op == OpCode::Incr {
+                cmd.val = Some(Bytes::from_static(b"1"));
+            } else if op == OpCode::Decr {
+                cmd.val = Some(Bytes::from_static(b"-1"));
+            }
+            Ok(cmd)
         }
         OpCode::Ping
         | OpCode::Multi
@@ -365,6 +623,7 @@ fn parse_resp3(frame: DecodedFrame<BytesFrame>) -> Result<Command, ParseError> {
         | OpCode::Hello
         | OpCode::Client
         | OpCode::Command
+        | OpCode::Config
         | OpCode::Reset
         | OpCode::Quit
         | OpCode::Select
@@ -387,12 +646,12 @@ fn parse_resp3(frame: DecodedFrame<BytesFrame>) -> Result<Command, ParseError> {
             if let Some(command) = command {
                 return Err(wrong_arity(command));
             }
-            Ok(Command {
+            Ok(Command::new(
                 op,
-                keys: Vec::new(),
-                val: None,
-                args: command_args(&parts).ok_or(ParseError::Protocol("invalid argument"))?,
-            })
+                Vec::new(),
+                None,
+                command_args(&parts).ok_or(ParseError::Protocol("invalid argument"))?,
+            ))
         }
     }
 }
@@ -513,11 +772,12 @@ fn parse_protocol_version(arg: &[u8]) -> Option<u8> {
 fn build_txn_ops(commands: &[Command]) -> (Vec<TxnOperation>, Vec<(usize, usize)>) {
     let mut ops = Vec::new();
     let mut spans = Vec::with_capacity(commands.len());
+    let mut next_group_id = 1u32;
 
     for cmd in commands {
         let start = ops.len();
         match cmd.op {
-            OpCode::Get | OpCode::Set => {
+            OpCode::Get | OpCode::Set | OpCode::GetSet | OpCode::SetNx => {
                 let Some(key) = cmd.keys.first() else {
                     spans.push((start, 0));
                     continue;
@@ -527,6 +787,21 @@ fn build_txn_ops(commands: &[Command]) -> (Vec<TxnOperation>, Vec<(usize, usize)
                 } else {
                     (std::ptr::null(), 0)
                 };
+                let mut flags = 0;
+                if cmd.set_condition == SetCondition::Nx {
+                    flags |= TXN_FLAG_SET_NX;
+                } else if cmd.set_condition == SetCondition::Xx {
+                    flags |= TXN_FLAG_SET_XX;
+                }
+                if cmd.set_return_old {
+                    flags |= TXN_FLAG_SET_RETURN_OLD;
+                }
+                if cmd.set_integer_reply {
+                    flags |= TXN_FLAG_SET_INTEGER_REPLY;
+                }
+                if cmd.set_keep_ttl {
+                    flags |= TXN_FLAG_SET_KEEP_TTL;
+                }
                 ops.push(TxnOperation {
                     op: if cmd.op == OpCode::Get {
                         TXN_OP_GET
@@ -537,7 +812,51 @@ fn build_txn_ops(commands: &[Command]) -> (Vec<TxnOperation>, Vec<(usize, usize)
                     key_len: key.len(),
                     val_ptr,
                     val_len,
+                    flags,
+                    expire_at_ms: cmd.expire_at_ms,
+                    group_id: 0,
                 });
+            }
+            OpCode::MGet => {
+                for key in &cmd.keys {
+                    ops.push(TxnOperation {
+                        op: TXN_OP_GET,
+                        key_ptr: key.as_ptr(),
+                        key_len: key.len(),
+                        val_ptr: std::ptr::null(),
+                        val_len: 0,
+                        flags: 0,
+                        expire_at_ms: -1,
+                        group_id: 0,
+                    });
+                }
+            }
+            OpCode::MSet | OpCode::MSetNx => {
+                let group_id = if cmd.op == OpCode::MSetNx {
+                    let id = next_group_id;
+                    next_group_id += 1;
+                    id
+                } else {
+                    0
+                };
+                for (key, val) in cmd.keys.iter().zip(cmd.values.iter()) {
+                    let mut flags = 0;
+                    if cmd.op == OpCode::MSetNx {
+                        flags |= TXN_FLAG_SET_NX
+                            | TXN_FLAG_SET_INTEGER_REPLY
+                            | TXN_FLAG_SET_REQUIRE_ABSENT_GROUP;
+                    }
+                    ops.push(TxnOperation {
+                        op: TXN_OP_SET,
+                        key_ptr: key.as_ptr(),
+                        key_len: key.len(),
+                        val_ptr: val.as_ptr(),
+                        val_len: val.len(),
+                        flags,
+                        expire_at_ms: -1,
+                        group_id,
+                    });
+                }
             }
             OpCode::Del | OpCode::Exists => {
                 let op = if cmd.op == OpCode::Del {
@@ -552,8 +871,57 @@ fn build_txn_ops(commands: &[Command]) -> (Vec<TxnOperation>, Vec<(usize, usize)
                         key_len: key.len(),
                         val_ptr: std::ptr::null(),
                         val_len: 0,
+                        flags: 0,
+                        expire_at_ms: -1,
+                        group_id: 0,
                     });
                 }
+            }
+            OpCode::Append
+            | OpCode::IncrBy
+            | OpCode::DecrBy
+            | OpCode::IncrByFloat
+            | OpCode::Incr
+            | OpCode::Decr => {
+                let Some(key) = cmd.keys.first() else {
+                    spans.push((start, 0));
+                    continue;
+                };
+                let Some(val) = cmd.val.as_ref() else {
+                    spans.push((start, 0));
+                    continue;
+                };
+                let op = match cmd.op {
+                    OpCode::Append => TXN_OP_APPEND,
+                    OpCode::IncrByFloat => TXN_OP_INCRBYFLOAT,
+                    _ => TXN_OP_INCRBY,
+                };
+                ops.push(TxnOperation {
+                    op,
+                    key_ptr: key.as_ptr(),
+                    key_len: key.len(),
+                    val_ptr: val.as_ptr(),
+                    val_len: val.len(),
+                    flags: 0,
+                    expire_at_ms: -1,
+                    group_id: 0,
+                });
+            }
+            OpCode::StrLen => {
+                let Some(key) = cmd.keys.first() else {
+                    spans.push((start, 0));
+                    continue;
+                };
+                ops.push(TxnOperation {
+                    op: TXN_OP_STRLEN,
+                    key_ptr: key.as_ptr(),
+                    key_len: key.len(),
+                    val_ptr: std::ptr::null(),
+                    val_len: 0,
+                    flags: 0,
+                    expire_at_ms: -1,
+                    group_id: 0,
+                });
             }
             _ => {}
         }
@@ -561,6 +929,34 @@ fn build_txn_ops(commands: &[Command]) -> (Vec<TxnOperation>, Vec<(usize, usize)
     }
 
     (ops, spans)
+}
+
+fn command_needs_retry(cmd: &Command) -> bool {
+    matches!(
+        cmd.op,
+        OpCode::Set
+            | OpCode::MSet
+            | OpCode::MSetNx
+            | OpCode::GetSet
+            | OpCode::SetNx
+            | OpCode::Append
+            | OpCode::Incr
+            | OpCode::IncrBy
+            | OpCode::Decr
+            | OpCode::DecrBy
+            | OpCode::IncrByFloat
+    )
+}
+
+const WRITING_TXN_MAX_ATTEMPTS: usize = 32;
+
+fn sleep_for_retry(attempt: usize) {
+    let delay_ms = match attempt {
+        0 => 1,
+        1 => 2,
+        _ => 4,
+    };
+    std::thread::sleep(std::time::Duration::from_millis(delay_ms));
 }
 
 /// Execute a single command as a transaction (for non-MULTI operations)
@@ -579,13 +975,34 @@ fn ffi_execute_single<W: Write>(cmd: &Command, writer: &mut W) -> std::io::Resul
         ops: ops.as_ptr(),
     };
 
+    let max_attempts = if command_needs_retry(cmd) {
+        WRITING_TXN_MAX_ATTEMPTS
+    } else {
+        1
+    };
     let mut response = TxnResponse {
         transaction_success: false,
         num_results: 0,
         results: std::ptr::null_mut(),
     };
+    let mut call_ok = false;
 
-    let call_ok = unsafe { cpp_execute_transaction(&request, &mut response) };
+    for attempt in 0..max_attempts {
+        response = TxnResponse {
+            transaction_success: false,
+            num_results: 0,
+            results: std::ptr::null_mut(),
+        };
+        call_ok = unsafe { cpp_execute_transaction(&request, &mut response) };
+        if call_ok && response.transaction_success && response.num_results >= ops.len() {
+            break;
+        }
+        unsafe { cpp_free_transaction_response(&mut response) };
+        if attempt + 1 < max_attempts {
+            unsafe { cpp_record_txn_retry() };
+            sleep_for_retry(attempt);
+        }
+    }
 
     if !call_ok || !response.transaction_success || response.num_results < ops.len() {
         unsafe { cpp_free_transaction_response(&mut response) };
@@ -623,13 +1040,34 @@ fn ffi_execute_transaction<W: Write>(commands: &[Command], writer: &mut W) -> st
         ops: ops.as_ptr(),
     };
 
+    let max_attempts = if commands.iter().any(command_needs_retry) {
+        WRITING_TXN_MAX_ATTEMPTS
+    } else {
+        1
+    };
     let mut response = TxnResponse {
         transaction_success: false,
         num_results: 0,
         results: std::ptr::null_mut(),
     };
+    let mut call_ok = false;
 
-    let call_ok = unsafe { cpp_execute_transaction(&request, &mut response) };
+    for attempt in 0..max_attempts {
+        response = TxnResponse {
+            transaction_success: false,
+            num_results: 0,
+            results: std::ptr::null_mut(),
+        };
+        call_ok = unsafe { cpp_execute_transaction(&request, &mut response) };
+        if call_ok && response.transaction_success && response.num_results >= ops.len() {
+            break;
+        }
+        unsafe { cpp_free_transaction_response(&mut response) };
+        if attempt + 1 < max_attempts {
+            unsafe { cpp_record_txn_retry() };
+            sleep_for_retry(attempt);
+        }
+    }
 
     if !call_ok || !response.transaction_success || response.num_results < ops.len() {
         // Transaction failed - return nil (EXECABORT equivalent)
@@ -679,7 +1117,7 @@ fn write_command_result<W: Write>(
 
     let first = unsafe { &*response.results.add(start) };
     match cmd.op {
-        OpCode::Get => {
+        OpCode::Get | OpCode::GetSet => {
             if !first.success {
                 write_err(writer, "operation failed")?;
             } else if first.value_present {
@@ -698,9 +1136,115 @@ fn write_command_result<W: Write>(
                 write_nil_bulk(writer)?;
             }
         }
+        OpCode::MGet => {
+            write_array_header(writer, len)?;
+            for index in start..start + len {
+                let result = unsafe { &*response.results.add(index) };
+                if !result.success {
+                    write_err(writer, "operation failed")?;
+                    return Ok(());
+                }
+                if result.value_present {
+                    if result.data_len > 0 {
+                        if result.data_ptr.is_null() {
+                            write_err(writer, "operation failed")?;
+                            return Ok(());
+                        }
+                        let data =
+                            unsafe { std::slice::from_raw_parts(result.data_ptr, result.data_len) };
+                        write_bulk(writer, data)?;
+                    } else {
+                        write_bulk(writer, b"")?;
+                    }
+                } else {
+                    write_nil_bulk(writer)?;
+                }
+            }
+        }
         OpCode::Set => {
-            if first.success {
+            if !first.success {
+                write_err(writer, "operation failed")?;
+            } else if cmd.set_return_old {
+                if first.value_present {
+                    if first.data_len > 0 {
+                        if first.data_ptr.is_null() {
+                            write_err(writer, "operation failed")?;
+                        } else {
+                            let data = unsafe {
+                                std::slice::from_raw_parts(first.data_ptr, first.data_len)
+                            };
+                            write_bulk(writer, data)?;
+                        }
+                    } else {
+                        write_bulk(writer, b"")?;
+                    }
+                } else {
+                    write_nil_bulk(writer)?;
+                }
+            } else if cmd.set_condition == SetCondition::None {
                 write_simple_ok(writer)?;
+            } else if first.value_present {
+                write_simple_ok(writer)?;
+            } else {
+                write_nil_bulk(writer)?;
+            }
+        }
+        OpCode::MSet => {
+            for index in start..start + len {
+                let result = unsafe { &*response.results.add(index) };
+                if !result.success {
+                    write_err(writer, "operation failed")?;
+                    return Ok(());
+                }
+            }
+            write_simple_ok(writer)?;
+        }
+        OpCode::MSetNx => {
+            let mut wrote_all = len > 0;
+            for index in start..start + len {
+                let result = unsafe { &*response.results.add(index) };
+                if !result.success {
+                    write_err(writer, "operation failed")?;
+                    return Ok(());
+                }
+                wrote_all &= result.value_present;
+            }
+            write_integer(writer, if wrote_all { 1 } else { 0 })?;
+        }
+        OpCode::SetNx => {
+            if first.success {
+                write_integer(writer, if first.value_present { 1 } else { 0 })?;
+            } else {
+                write_err(writer, "operation failed")?;
+            }
+        }
+        OpCode::Append
+        | OpCode::StrLen
+        | OpCode::Incr
+        | OpCode::IncrBy
+        | OpCode::Decr
+        | OpCode::DecrBy => {
+            if first.success {
+                write_integer(writer, first.int_value)?;
+            } else {
+                write_err(writer, "operation failed")?;
+            }
+        }
+        OpCode::IncrByFloat => {
+            if !first.success {
+                write_err(writer, "operation failed")?;
+            } else if first.value_present {
+                if first.data_len > 0 {
+                    if first.data_ptr.is_null() {
+                        write_err(writer, "operation failed")?;
+                    } else {
+                        let data =
+                            unsafe { std::slice::from_raw_parts(first.data_ptr, first.data_len) };
+                        write_bulk(writer, data)?;
+                    }
+                } else {
+                    write_bulk(writer, b"")?;
+                }
             } else {
                 write_err(writer, "operation failed")?;
             }
@@ -734,7 +1278,7 @@ fn create_reuseport_listener(addr: &str) -> std::io::Result<TcpListener> {
     let socket = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))?;
     socket.set_reuse_address(true)?;
     socket.set_reuse_port(true)?;
-    socket.set_nonblocking(false)?;
+    socket.set_nonblocking(true)?;
     socket.set_nodelay(true)?;
     socket.bind(&addr.into())?;
     socket.listen(1024)?;
@@ -751,7 +1295,7 @@ pub extern "C" fn rust_init(n_threads: usize) -> bool {
     let ready_count = Arc::new(AtomicUsize::new(0));
 
     println!(
-        "Starting {} thread-per-core workers on {} (SO_REUSEPORT, 100% SYNC, MULTI/EXEC support)",
+        "Starting {} thread-per-core workers on {} (SO_REUSEPORT, nonblocking clients, MULTI/EXEC support)",
         n_threads, addr
     );
 
@@ -785,20 +1329,63 @@ pub extern "C" fn rust_init(n_threads: usize) -> bool {
                     );
                 }
 
+                let mut clients = Vec::new();
                 loop {
-                    match listener.accept() {
-                        Ok((mut stream, _)) => {
-                            let _ = stream.set_nodelay(true);
-                            TOTAL_CONNECTIONS_RECEIVED.fetch_add(1, Ordering::Relaxed);
-                            CONNECTED_CLIENTS.fetch_add(1, Ordering::Relaxed);
-                            if let Err(e) = handle_client_sync(&mut stream) {
-                                eprintln!("Client handling error: {e}");
+                    let mut made_progress = false;
+
+                    loop {
+                        match listener.accept() {
+                            Ok((stream, _)) => {
+                                let _ = stream.set_nodelay(true);
+                                if let Err(e) = stream.set_nonblocking(true) {
+                                    eprintln!(
+                                        "[thread-{}] Client nonblocking error: {e}",
+                                        thread_id
+                                    );
+                                    continue;
+                                }
+                                TOTAL_CONNECTIONS_RECEIVED.fetch_add(1, Ordering::Relaxed);
+                                CONNECTED_CLIENTS.fetch_add(1, Ordering::Relaxed);
+                                clients.push(ClientConn::new(stream));
+                                made_progress = true;
                             }
-                            CONNECTED_CLIENTS.fetch_sub(1, Ordering::Relaxed);
+                            Err(e) if e.kind() == ErrorKind::WouldBlock => break,
+                            Err(e) => {
+                                eprintln!("[thread-{}] Accept error: {e}", thread_id);
+                                break;
+                            }
                         }
-                        Err(e) => {
-                            eprintln!("[thread-{}] Accept error: {e}", thread_id);
+                    }
+
+                    let mut idx = 0;
+                    while idx < clients.len() {
+                        match service_client(&mut clients[idx]) {
+                            Ok(ClientEvent::Keep) => {
+                                idx += 1;
+                            }
+                            Ok(ClientEvent::Progress) => {
+                                made_progress = true;
+                                idx += 1;
+                            }
+                            Ok(ClientEvent::Close) => {
+                                clients.swap_remove(idx);
+                                CONNECTED_CLIENTS.fetch_sub(1, Ordering::Relaxed);
+                                made_progress = true;
+                            }
+                            Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                                idx += 1;
+                            }
+                            Err(e) => {
+                                eprintln!("Client handling error: {e}");
+                                clients.swap_remove(idx);
+                                CONNECTED_CLIENTS.fetch_sub(1, Ordering::Relaxed);
+                                made_progress = true;
+                            }
                         }
+                    }
+
+                    if !made_progress {
+                        std::thread::sleep(std::time::Duration::from_millis(1));
                     }
                 }
             })
@@ -808,46 +1395,122 @@ pub extern "C" fn rust_init(n_threads: usize) -> bool {
     true
 }
 
-/// Handle client with MULTI/EXEC transaction support
-fn handle_client_sync(stream: &mut TcpStream) -> std::io::Result<()> {
-    let mut resp3 = Resp3Handler::new(10 * 1024 * 1024);
-    let mut read_buf = [0u8; 16384];
-    let mut writer = BufWriter::with_capacity(16384, stream.try_clone()?);
-    let mut txn_state = TransactionState::new();
-    let mut client_state = ClientState::new();
+struct ClientConn {
+    stream: TcpStream,
+    resp3: Resp3Handler,
+    read_buf: [u8; 16384],
+    write_buf: Vec<u8>,
+    txn_state: TransactionState,
+    client_state: ClientState,
+    close_after_write: bool,
+}
 
-    loop {
-        match stream.read(&mut read_buf) {
-            Ok(0) => break,
-            Ok(n) => resp3.read_bytes(&read_buf[..n]),
+impl ClientConn {
+    fn new(stream: TcpStream) -> Self {
+        ClientConn {
+            stream,
+            resp3: Resp3Handler::new(10 * 1024 * 1024),
+            read_buf: [0u8; 16384],
+            write_buf: Vec::with_capacity(16384),
+            txn_state: TransactionState::new(),
+            client_state: ClientState::new(),
+            close_after_write: false,
+        }
+    }
+}
+
+enum ClientEvent {
+    Keep,
+    Progress,
+    Close,
+}
+
+fn flush_client(client: &mut ClientConn) -> std::io::Result<bool> {
+    while !client.write_buf.is_empty() {
+        match client.stream.write(&client.write_buf) {
+            Ok(0) => return Ok(false),
+            Ok(n) => {
+                client.write_buf.drain(..n);
+            }
+            Err(e) if e.kind() == ErrorKind::WouldBlock => return Ok(true),
             Err(e) => return Err(e),
         }
+    }
+    Ok(true)
+}
 
-        loop {
-            match resp3.next_frame() {
-                Ok(Some(frame)) => match parse_resp3(frame) {
-                    Ok(cmd) => {
-                        handle_command(&cmd, &mut txn_state, &mut client_state, &mut writer)?;
+fn service_client(client: &mut ClientConn) -> std::io::Result<ClientEvent> {
+    let mut made_progress = false;
+
+    if !client.write_buf.is_empty() {
+        if !flush_client(client)? {
+            return Ok(ClientEvent::Close);
+        }
+        made_progress = true;
+    }
+    if client.close_after_write && client.write_buf.is_empty() {
+        return Ok(ClientEvent::Close);
+    }
+
+    loop {
+        match client.stream.read(&mut client.read_buf) {
+            Ok(0) => {
+                return if client.write_buf.is_empty() {
+                    Ok(ClientEvent::Close)
+                } else {
+                    client.close_after_write = true;
+                    Ok(ClientEvent::Progress)
+                };
+            }
+            Ok(n) => {
+                client.resp3.read_bytes(&client.read_buf[..n]);
+                made_progress = true;
+
+                loop {
+                    match client.resp3.next_frame() {
+                        Ok(Some(frame)) => match parse_resp3(frame) {
+                            Ok(cmd) => {
+                                handle_command(
+                                    &cmd,
+                                    &mut client.txn_state,
+                                    &mut client.client_state,
+                                    &mut client.write_buf,
+                                )?;
+                                if client.client_state.close_after_reply {
+                                    client.close_after_write = true;
+                                }
+                            }
+                            Err(err) => {
+                                write_parse_error(&mut client.write_buf, err)?;
+                            }
+                        },
+                        Ok(None) => break,
+                        Err(_) => {
+                            write_err(&mut client.write_buf, "protocol error")?;
+                            break;
+                        }
                     }
-                    Err(err) => {
-                        write_parse_error(&mut writer, err)?;
-                    }
-                },
-                Ok(None) => break,
-                Err(_) => {
-                    write_err(&mut writer, "protocol error")?;
-                    break;
                 }
             }
-        }
-
-        writer.flush()?;
-        if client_state.close_after_reply {
-            break;
+            Err(e) if e.kind() == ErrorKind::WouldBlock => break,
+            Err(e) => return Err(e),
         }
     }
 
-    Ok(())
+    if !client.write_buf.is_empty() {
+        if !flush_client(client)? {
+            return Ok(ClientEvent::Close);
+        }
+        made_progress = true;
+    }
+
+    if client.close_after_write && client.write_buf.is_empty() {
+        Ok(ClientEvent::Close)
+    } else if made_progress {
+        Ok(ClientEvent::Progress)
+    } else {
+        Ok(ClientEvent::Keep)
+    }
 }
 
 fn write_hello_response<W: Write>(
@@ -862,7 +1525,7 @@ fn write_hello_response<W: Write>(
     write_simple_string(writer, "proto")?;
     write_integer(writer, client_state.protocol_version as i64)?;
     write_simple_string(writer, "id")?;
-    write_integer(writer, 0)?;
+    write_integer(writer, client_state.id as i64)?;
     write_simple_string(writer, "mode")?;
     write_simple_string(writer, "standalone")?;
     write_simple_string(writer, "role")?;
@@ -947,7 +1610,7 @@ fn handle_client_command<W: Write>(
             write_err(writer, "wrong number of arguments for 'client id' command")?;
             return Ok(());
         }
-        write_integer(writer, 0)
+        write_integer(writer, client_state.id as i64)
     } else if ascii_eq_ci(subcommand, b"SETINFO") {
         if cmd.args.len() < 3 {
             write_err(
@@ -988,7 +1651,7 @@ fn handle_client_command<W: Write>(
             .as_ref()
             .map(|n| String::from_utf8_lossy(n).into_owned())
             .unwrap_or_default();
-        let line = format!("id=0 name={} flags=N db=0\r\n", name);
+        let line = format!("id={} name={} flags=N db=0\r\n", client_state.id, name);
         write_bulk(writer, line.as_bytes())
     } else {
         write_err(writer, "unsupported CLIENT subcommand")
@@ -1004,6 +1667,75 @@ fn handle_command_command<W: Write>(cmd: &Command, writer: &mut W) -> std::io::R
         write_integer(writer, 0)
     } else {
         write_err(writer, "unsupported COMMAND subcommand")
+    }
+}
+
+fn config_value(name: &[u8]) -> Option<(&'static [u8], &'static [u8])> {
+    if ascii_eq_ci(name, b"save") {
+        Some((b"save", b""))
+    } else if ascii_eq_ci(name, b"appendonly") {
+        Some((b"appendonly", b"no"))
+    } else if ascii_eq_ci(name, b"databases") {
+        Some((b"databases", b"1"))
+    } else if ascii_eq_ci(name, b"maxmemory") {
+        Some((b"maxmemory", b"0"))
+    } else {
+        None
+    }
+}
+
+fn config_pattern_matches(pattern: &[u8], name: &[u8]) -> bool {
+    pattern == b"*" || ascii_eq_ci(pattern, name)
+}
+
+fn handle_config_command<W: Write>(cmd: &Command, writer: &mut W) -> std::io::Result<()> {
+    let Some(subcommand) = cmd.args.first() else {
+        write_err(writer, "wrong number of arguments for 'config' command")?;
+        return Ok(());
+    };
+
+    if ascii_eq_ci(subcommand, b"GET") {
+        if cmd.args.len() != 2 {
+            write_err(writer, "wrong number of arguments for 'config|get' command")?;
+            return Ok(());
+        }
+        let known = [
+            b"save".as_slice(),
+            b"appendonly",
+            b"databases",
+            b"maxmemory",
+        ];
+        let mut entries = Vec::new();
+        for name in known {
+            if config_pattern_matches(cmd.args[1].as_ref(), name) {
+                if let Some(pair) = config_value(name) {
+                    entries.push(pair);
+                }
+            }
+        }
+        write_array_header(writer, entries.len() * 2)?;
+        for (name, value) in entries {
+            write_bulk(writer, name)?;
+            write_bulk(writer, value)?;
+        }
+        Ok(())
+    } else if ascii_eq_ci(subcommand, b"SET") {
+        if cmd.args.len() != 3 {
+            write_err(writer, "wrong number of arguments for 'config|set' command")?;
+            return Ok(());
+        }
+        write_simple_ok(writer)
+    } else if ascii_eq_ci(subcommand, b"RESETSTAT") {
+        if cmd.args.len() != 1 {
+            write_err(
+                writer,
+                "wrong number of arguments for 'config|resetstat' command",
+            )?;
+            return Ok(());
+        }
+        write_simple_ok(writer)
+    } else {
+        write_err(writer, "unsupported CONFIG subcommand")
     }
 }
 
@@ -1108,6 +1840,9 @@ fn handle_command<W: Write>(
         OpCode::Command => {
             handle_command_command(cmd, writer)?;
         }
+        OpCode::Config => {
+            handle_config_command(cmd, writer)?;
+        }
         OpCode::Reset => {
             txn_state.discard();
             client_state.reset();
@@ -1165,7 +1900,22 @@ fn handle_command<W: Write>(
                 write_simple_ok(writer)?;
             }
         }
-        OpCode::Get | OpCode::Set | OpCode::Del | OpCode::Exists => {
+        OpCode::Get
+        | OpCode::Set
+        | OpCode::Del
+        | OpCode::Exists
+        | OpCode::MGet
+        | OpCode::MSet
+        | OpCode::MSetNx
+        | OpCode::GetSet
+        | OpCode::SetNx
+        | OpCode::Append
+        | OpCode::StrLen
+        | OpCode::Incr
+        | OpCode::IncrBy
+        | OpCode::Decr
+        | OpCode::DecrBy
+        | OpCode::IncrByFloat => {
             if txn_state.in_multi {
                 // Queue command for later execution
                 txn_state.queue_command(cmd.clone());
@@ -1185,21 +1935,21 @@ mod tests {
     use super::*;
 
     fn command(op: OpCode, args: &[&[u8]]) -> Command {
-        Command {
+        Command::new(
             op,
-            keys: Vec::new(),
-            val: None,
-            args: args.iter().map(|arg| Bytes::copy_from_slice(arg)).collect(),
-        }
+            Vec::new(),
+            None,
+            args.iter().map(|arg| Bytes::copy_from_slice(arg)).collect(),
+        )
     }
 
     fn data_command(op: OpCode, keys: &[&[u8]], val: Option<&[u8]>) -> Command {
-        Command {
+        Command::new(
             op,
-            keys: keys.iter().map(|key| Bytes::copy_from_slice(key)).collect(),
-            val: val.map(Bytes::copy_from_slice),
-            args: keys.iter().map(|key| Bytes::copy_from_slice(key)).collect(),
-        }
+            keys.iter().map(|key| Bytes::copy_from_slice(key)).collect(),
+            val.map(Bytes::copy_from_slice),
+            keys.iter().map(|key| Bytes::copy_from_slice(key)).collect(),
+        )
     }
 
     fn run(
@@ -1249,6 +1999,7 @@ mod tests {
         assert!(text.starts_with("%"));
         assert!(text.contains("+server\r\n+makoCon\r\n"));
         assert!(text.contains("+proto\r\n:3\r\n"));
+        assert!(text.contains("+id\r\n:"));
         assert_eq!(client_state.protocol_version, 3);
     }
 
@@ -1297,6 +2048,33 @@ mod tests {
         assert_eq!(no_evict, b"+OK\r\n");
         assert_eq!(reply, b"+OK\r\n");
         assert!(String::from_utf8(list).unwrap().contains("name=phase2"));
+    }
+
+    #[test]
+    fn client_id_is_stable_for_connection() {
+        let mut txn_state = TransactionState::new();
+        let mut client_state = ClientState::new();
+        let expected = format!(":{}\r\n", client_state.id).into_bytes();
+
+        let first = run(
+            command(OpCode::Client, &[b"ID"]),
+            &mut txn_state,
+            &mut client_state,
+        );
+        let reset = run(
+            command(OpCode::Reset, &[]),
+            &mut txn_state,
+            &mut client_state,
+        );
+        let second = run(
+            command(OpCode::Client, &[b"ID"]),
+            &mut txn_state,
+            &mut client_state,
+        );
+
+        assert_eq!(first, expected);
+        assert_eq!(reset, b"+RESET\r\n");
+        assert_eq!(second, first);
     }
 
     #[test]
@@ -1375,6 +2153,32 @@ mod tests {
     }
 
     #[test]
+    fn config_get_and_resetstat_return_client_compatible_replies() {
+        let mut txn_state = TransactionState::new();
+        let mut client_state = ClientState::new();
+
+        let get_save = run(
+            command(OpCode::Config, &[b"GET", b"save"]),
+            &mut txn_state,
+            &mut client_state,
+        );
+        let get_all = run(
+            command(OpCode::Config, &[b"GET", b"*"]),
+            &mut txn_state,
+            &mut client_state,
+        );
+        let resetstat = run(
+            command(OpCode::Config, &[b"RESETSTAT"]),
+            &mut txn_state,
+            &mut client_state,
+        );
+
+        assert_eq!(get_save, b"*2\r\n$4\r\nsave\r\n$0\r\n\r\n");
+        assert!(get_all.starts_with(b"*8\r\n"));
+        assert_eq!(resetstat, b"+OK\r\n");
+    }
+
+    #[test]
     fn info_server_returns_parseable_server_section() {
         let mut txn_state = TransactionState::new();
         let mut client_state = ClientState::new();
@@ -1438,6 +2242,7 @@ mod tests {
             value_present: true,
             data_ptr: std::ptr::null_mut(),
             data_len: 0,
+            int_value: 0,
         }];
         let response = TxnResponse {
             transaction_success: true,
@@ -1459,6 +2264,7 @@ mod tests {
             value_present: false,
             data_ptr: std::ptr::null_mut(),
             data_len: 0,
+            int_value: 0,
         }];
         let response = TxnResponse {
             transaction_success: true,
@@ -1481,18 +2287,21 @@ mod tests {
                 value_present: true,
                 data_ptr: std::ptr::null_mut(),
                 data_len: 0,
+                int_value: 0,
             },
             TxnOpResult {
                 success: true,
                 value_present: true,
                 data_ptr: std::ptr::null_mut(),
                 data_len: 0,
+                int_value: 0,
             },
             TxnOpResult {
                 success: true,
                 value_present: true,
                 data_ptr: std::ptr::null_mut(),
                 data_len: 0,
+                int_value: 0,
             },
         ];
         let response = TxnResponse {
