@@ -11,6 +11,9 @@ use std::sync::Barrier;
 mod resp3_handler;
 use resp3_handler::Resp3Handler;
 
+static CONNECTED_CLIENTS: AtomicUsize = AtomicUsize::new(0);
+static TOTAL_CONNECTIONS_RECEIVED: AtomicUsize = AtomicUsize::new(0);
+
 // ===== FFI Types (must match transaction_ffi.h) =====
 
 const TXN_OP_GET: u32 = 1;
@@ -786,9 +789,12 @@ pub extern "C" fn rust_init(n_threads: usize) -> bool {
                     match listener.accept() {
                         Ok((mut stream, _)) => {
                             let _ = stream.set_nodelay(true);
+                            TOTAL_CONNECTIONS_RECEIVED.fetch_add(1, Ordering::Relaxed);
+                            CONNECTED_CLIENTS.fetch_add(1, Ordering::Relaxed);
                             if let Err(e) = handle_client_sync(&mut stream) {
                                 eprintln!("Client handling error: {e}");
                             }
+                            CONNECTED_CLIENTS.fetch_sub(1, Ordering::Relaxed);
                         }
                         Err(e) => {
                             eprintln!("[thread-{}] Accept error: {e}", thread_id);
@@ -1017,8 +1023,22 @@ fn append_server_info(out: &mut String, metrics: &MakoMetrics) {
     out.push_str("mako_version:0.1.0\r\n");
     out.push_str("redis_mode:standalone\r\n");
     out.push_str("role:master\r\n");
+    out.push_str("total_connections_received:");
+    out.push_str(
+        &TOTAL_CONNECTIONS_RECEIVED
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push_str("\r\n");
     out.push_str("uptime_in_seconds:");
     out.push_str(&metrics.uptime_seconds.to_string());
+    out.push_str("\r\n\r\n");
+}
+
+fn append_clients_info(out: &mut String) {
+    out.push_str("# Clients\r\n");
+    out.push_str("connected_clients:");
+    out.push_str(&CONNECTED_CLIENTS.load(Ordering::Relaxed).to_string());
     out.push_str("\r\n\r\n");
 }
 
@@ -1046,9 +1066,12 @@ fn handle_info<W: Write>(cmd: &Command, writer: &mut W) -> std::io::Result<()> {
 
     if ascii_eq_ci(section, b"default") || ascii_eq_ci(section, b"all") {
         append_server_info(&mut out, &metrics);
+        append_clients_info(&mut out);
         append_mako_info(&mut out, &metrics);
     } else if ascii_eq_ci(section, b"server") {
         append_server_info(&mut out, &metrics);
+    } else if ascii_eq_ci(section, b"clients") {
+        append_clients_info(&mut out);
     } else if ascii_eq_ci(section, b"mako") {
         append_mako_info(&mut out, &metrics);
     }
@@ -1355,6 +1378,7 @@ mod tests {
     fn info_server_returns_parseable_server_section() {
         let mut txn_state = TransactionState::new();
         let mut client_state = ClientState::new();
+        TOTAL_CONNECTIONS_RECEIVED.store(7, Ordering::Relaxed);
 
         let out = run(
             command(OpCode::Info, &[b"server"]),
@@ -1367,7 +1391,25 @@ mod tests {
         assert!(text.contains("# Server\r\n"));
         assert!(text.contains("redis_version:"));
         assert!(text.contains("mako_version:"));
+        assert!(text.contains("total_connections_received:7\r\n"));
         assert!(text.contains("uptime_in_seconds:42\r\n"));
+    }
+
+    #[test]
+    fn info_clients_returns_connection_metrics() {
+        let mut txn_state = TransactionState::new();
+        let mut client_state = ClientState::new();
+        CONNECTED_CLIENTS.store(3, Ordering::Relaxed);
+
+        let out = run(
+            command(OpCode::Info, &[b"clients"]),
+            &mut txn_state,
+            &mut client_state,
+        );
+        let text = String::from_utf8(out).unwrap();
+
+        assert!(text.contains("# Clients\r\n"));
+        assert!(text.contains("connected_clients:3\r\n"));
     }
 
     #[test]
