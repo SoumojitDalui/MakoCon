@@ -16,6 +16,9 @@ static TOTAL_CONNECTIONS_RECEIVED: AtomicUsize = AtomicUsize::new(0);
 static NEXT_CLIENT_ID: AtomicUsize = AtomicUsize::new(1);
 
 // ===== FFI Types (must match transaction_ffi.h) =====
+// Redis-visible keys must not use the 0x01 prefix. The C++ executor stores
+// TTL metadata under "\x01TTL:<key>" and keeps expiry checks inside the same
+// transaction as the user-key operation.
 
 const TXN_OP_GET: u32 = 1;
 const TXN_OP_SET: u32 = 2;
@@ -25,6 +28,9 @@ const TXN_OP_APPEND: u32 = 5;
 const TXN_OP_STRLEN: u32 = 6;
 const TXN_OP_INCRBY: u32 = 7;
 const TXN_OP_INCRBYFLOAT: u32 = 8;
+const TXN_OP_EXPIRE: u32 = 9;
+const TXN_OP_TTL: u32 = 10;
+const TXN_OP_PERSIST: u32 = 11;
 
 const TXN_FLAG_SET_NX: u32 = 1 << 0;
 const TXN_FLAG_SET_XX: u32 = 1 << 1;
@@ -32,6 +38,11 @@ const TXN_FLAG_SET_RETURN_OLD: u32 = 1 << 2;
 const TXN_FLAG_SET_INTEGER_REPLY: u32 = 1 << 3;
 const TXN_FLAG_SET_REQUIRE_ABSENT_GROUP: u32 = 1 << 4;
 const TXN_FLAG_SET_KEEP_TTL: u32 = 1 << 5;
+const TXN_FLAG_TTL_MILLISECONDS: u32 = 1 << 6;
+const TXN_FLAG_EXPIRE_NX: u32 = 1 << 7;
+const TXN_FLAG_EXPIRE_XX: u32 = 1 << 8;
+const TXN_FLAG_EXPIRE_GT: u32 = 1 << 9;
+const TXN_FLAG_EXPIRE_LT: u32 = 1 << 10;
 
 #[repr(C)]
 struct TxnOperation {
@@ -151,6 +162,13 @@ enum OpCode {
     DecrBy = 28,
     IncrByFloat = 29,
     Config = 30,
+    Expire = 31,
+    PExpire = 32,
+    ExpireAt = 33,
+    PExpireAt = 34,
+    Ttl = 35,
+    PTtl = 36,
+    Persist = 37,
 }
 
 #[derive(Copy, Clone, PartialEq)]
@@ -172,6 +190,7 @@ struct Command {
     set_integer_reply: bool,
     set_keep_ttl: bool,
     expire_at_ms: i64,
+    expire_flags: u32,
 }
 
 impl Command {
@@ -187,12 +206,14 @@ impl Command {
             set_integer_reply: false,
             set_keep_ttl: false,
             expire_at_ms: -1,
+            expire_flags: 0,
         }
     }
 }
 
 enum ParseError {
     Protocol(&'static str),
+    Error(&'static str),
     UnknownCommand { name: Bytes, args: Vec<Bytes> },
     WrongArity { command: &'static str },
 }
@@ -305,6 +326,20 @@ fn parse_opcode(name: &[u8]) -> Option<OpCode> {
         Some(OpCode::DecrBy)
     } else if ascii_eq_ci(name, b"INCRBYFLOAT") {
         Some(OpCode::IncrByFloat)
+    } else if ascii_eq_ci(name, b"EXPIRE") {
+        Some(OpCode::Expire)
+    } else if ascii_eq_ci(name, b"PEXPIRE") {
+        Some(OpCode::PExpire)
+    } else if ascii_eq_ci(name, b"EXPIREAT") {
+        Some(OpCode::ExpireAt)
+    } else if ascii_eq_ci(name, b"PEXPIREAT") {
+        Some(OpCode::PExpireAt)
+    } else if ascii_eq_ci(name, b"TTL") {
+        Some(OpCode::Ttl)
+    } else if ascii_eq_ci(name, b"PTTL") {
+        Some(OpCode::PTtl)
+    } else if ascii_eq_ci(name, b"PERSIST") {
+        Some(OpCode::Persist)
     } else if ascii_eq_ci(name, b"DEL") {
         Some(OpCode::Del)
     } else if ascii_eq_ci(name, b"UNLINK") {
@@ -374,6 +409,26 @@ fn part_to_bytes(part: &BytesFrame) -> Result<Bytes, ParseError> {
     }
 }
 
+fn validate_user_key(key: &Bytes) -> Result<(), ParseError> {
+    if key.first() == Some(&0x01) {
+        Err(ParseError::Error("invalid key: reserved internal prefix"))
+    } else {
+        Ok(())
+    }
+}
+
+fn checked_abs_ms_from_seconds(amount: i64) -> Result<i64, ParseError> {
+    amount
+        .checked_mul(1000)
+        .ok_or(ParseError::Protocol("invalid expire time"))
+}
+
+fn checked_relative_ms(now_ms: i64, amount_ms: i64) -> Result<i64, ParseError> {
+    now_ms
+        .checked_add(amount_ms)
+        .ok_or(ParseError::Protocol("invalid expire time"))
+}
+
 fn ttl_ms_from_args(unit: &[u8], value: &[u8]) -> Result<i64, ParseError> {
     let text = std::str::from_utf8(value).map_err(|_| ParseError::Protocol("invalid argument"))?;
     let amount: i64 = text
@@ -387,14 +442,64 @@ fn ttl_ms_from_args(unit: &[u8], value: &[u8]) -> Result<i64, ParseError> {
         .map_err(|_| ParseError::Protocol("invalid argument"))?
         .as_millis() as i64;
     if ascii_eq_ci(unit, b"EX") {
-        Ok(now_ms + amount * 1000)
+        checked_relative_ms(now_ms, checked_abs_ms_from_seconds(amount)?)
     } else if ascii_eq_ci(unit, b"PX") {
-        Ok(now_ms + amount)
+        checked_relative_ms(now_ms, amount)
     } else if ascii_eq_ci(unit, b"EXAT") {
-        Ok(amount * 1000)
+        checked_abs_ms_from_seconds(amount)
     } else {
         Ok(amount)
     }
+}
+
+fn expire_at_ms_from_args(unit: &[u8], value: &[u8]) -> Result<i64, ParseError> {
+    let text = std::str::from_utf8(value).map_err(|_| ParseError::Protocol("invalid argument"))?;
+    let amount: i64 = text
+        .parse()
+        .map_err(|_| ParseError::Protocol("invalid argument"))?;
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|_| ParseError::Protocol("invalid argument"))?
+        .as_millis() as i64;
+    if ascii_eq_ci(unit, b"EXPIRE") {
+        checked_relative_ms(now_ms, checked_abs_ms_from_seconds(amount)?)
+    } else if ascii_eq_ci(unit, b"PEXPIRE") {
+        checked_relative_ms(now_ms, amount)
+    } else if ascii_eq_ci(unit, b"EXPIREAT") {
+        checked_abs_ms_from_seconds(amount)
+    } else {
+        Ok(amount)
+    }
+}
+
+fn parse_expire_modifier(arg: &[u8]) -> Result<u32, ParseError> {
+    if ascii_eq_ci(arg, b"NX") {
+        Ok(TXN_FLAG_EXPIRE_NX)
+    } else if ascii_eq_ci(arg, b"XX") {
+        Ok(TXN_FLAG_EXPIRE_XX)
+    } else if ascii_eq_ci(arg, b"GT") {
+        Ok(TXN_FLAG_EXPIRE_GT)
+    } else if ascii_eq_ci(arg, b"LT") {
+        Ok(TXN_FLAG_EXPIRE_LT)
+    } else {
+        Err(ParseError::Protocol("syntax error"))
+    }
+}
+
+fn validate_expire_flags(flags: u32) -> Result<(), ParseError> {
+    if (flags & TXN_FLAG_EXPIRE_NX) != 0
+        && (flags & (TXN_FLAG_EXPIRE_XX | TXN_FLAG_EXPIRE_GT | TXN_FLAG_EXPIRE_LT)) != 0
+    {
+        return Err(ParseError::Error(
+            "NX and XX, GT or LT options at the same time are not compatible",
+        ));
+    }
+    if (flags & TXN_FLAG_EXPIRE_GT) != 0 && (flags & TXN_FLAG_EXPIRE_LT) != 0 {
+        return Err(ParseError::Error(
+            "GT and LT options at the same time are not compatible",
+        ));
+    }
+    Ok(())
 }
 
 /// Parse RESP3 frame into Command
@@ -427,6 +532,7 @@ fn parse_resp3(frame: DecodedFrame<BytesFrame>) -> Result<Command, ParseError> {
                 return Err(wrong_arity("get"));
             }
             let key = part_to_bytes(&parts[1])?;
+            validate_user_key(&key)?;
             Ok(Command::new(
                 op,
                 vec![key],
@@ -440,7 +546,9 @@ fn parse_resp3(frame: DecodedFrame<BytesFrame>) -> Result<Command, ParseError> {
             }
             let mut keys = Vec::with_capacity(parts.len() - 1);
             for part in parts.iter().skip(1) {
-                keys.push(part_to_bytes(part)?);
+                let key = part_to_bytes(part)?;
+                validate_user_key(&key)?;
+                keys.push(key);
             }
             Ok(Command::new(
                 op,
@@ -459,7 +567,9 @@ fn parse_resp3(frame: DecodedFrame<BytesFrame>) -> Result<Command, ParseError> {
             }
             let mut keys = Vec::with_capacity(parts.len() - 1);
             for part in parts.iter().skip(1) {
-                keys.push(part_to_bytes(part)?);
+                let key = part_to_bytes(part)?;
+                validate_user_key(&key)?;
+                keys.push(key);
             }
             Ok(Command::new(
                 op,
@@ -473,6 +583,7 @@ fn parse_resp3(frame: DecodedFrame<BytesFrame>) -> Result<Command, ParseError> {
                 return Err(wrong_arity("set"));
             }
             let key = part_to_bytes(&parts[1])?;
+            validate_user_key(&key)?;
             let val = part_to_bytes(&parts[2])?;
             let mut cmd = Command::new(
                 op,
@@ -537,7 +648,9 @@ fn parse_resp3(frame: DecodedFrame<BytesFrame>) -> Result<Command, ParseError> {
             let mut keys = Vec::with_capacity((parts.len() - 1) / 2);
             let mut values = Vec::with_capacity((parts.len() - 1) / 2);
             for pair in parts[1..].chunks_exact(2) {
-                keys.push(part_to_bytes(&pair[0])?);
+                let key = part_to_bytes(&pair[0])?;
+                validate_user_key(&key)?;
+                keys.push(key);
                 values.push(part_to_bytes(&pair[1])?);
             }
             let mut cmd = Command::new(
@@ -567,6 +680,7 @@ fn parse_resp3(frame: DecodedFrame<BytesFrame>) -> Result<Command, ParseError> {
                 }));
             }
             let key = part_to_bytes(&parts[1])?;
+            validate_user_key(&key)?;
             let mut val = part_to_bytes(&parts[2])?;
             if op == OpCode::DecrBy {
                 let text = std::str::from_utf8(val.as_ref())
@@ -603,6 +717,7 @@ fn parse_resp3(frame: DecodedFrame<BytesFrame>) -> Result<Command, ParseError> {
                 }));
             }
             let key = part_to_bytes(&parts[1])?;
+            validate_user_key(&key)?;
             let mut cmd = Command::new(
                 op,
                 vec![key],
@@ -615,6 +730,64 @@ fn parse_resp3(frame: DecodedFrame<BytesFrame>) -> Result<Command, ParseError> {
                 cmd.val = Some(Bytes::from_static(b"-1"));
             }
             Ok(cmd)
+        }
+        OpCode::Expire | OpCode::PExpire | OpCode::ExpireAt | OpCode::PExpireAt => {
+            if parts.len() < 3 {
+                return Err(wrong_arity(match op {
+                    OpCode::Expire => "expire",
+                    OpCode::PExpire => "pexpire",
+                    OpCode::ExpireAt => "expireat",
+                    OpCode::PExpireAt => "pexpireat",
+                    _ => "command",
+                }));
+            }
+            let key = part_to_bytes(&parts[1])?;
+            validate_user_key(&key)?;
+            let ttl = part_to_bytes(&parts[2])?;
+            let mut cmd = Command::new(
+                op,
+                vec![key],
+                None,
+                command_args(&parts).ok_or(ParseError::Protocol("invalid argument"))?,
+            );
+            let unit = match op {
+                OpCode::Expire => b"EXPIRE".as_slice(),
+                OpCode::PExpire => b"PEXPIRE".as_slice(),
+                OpCode::ExpireAt => b"EXPIREAT".as_slice(),
+                OpCode::PExpireAt => b"PEXPIREAT".as_slice(),
+                _ => b"",
+            };
+            cmd.expire_at_ms = expire_at_ms_from_args(unit, ttl.as_ref())?;
+            let mut index = 3;
+            while index < parts.len() {
+                let arg = part_to_bytes(&parts[index])?;
+                let flag = parse_expire_modifier(arg.as_ref())?;
+                if (cmd.expire_flags & flag) != 0 {
+                    return Err(ParseError::Protocol("syntax error"));
+                }
+                cmd.expire_flags |= flag;
+                validate_expire_flags(cmd.expire_flags)?;
+                index += 1;
+            }
+            Ok(cmd)
+        }
+        OpCode::Ttl | OpCode::PTtl | OpCode::Persist => {
+            if parts.len() != 2 {
+                return Err(wrong_arity(match op {
+                    OpCode::Ttl => "ttl",
+                    OpCode::PTtl => "pttl",
+                    OpCode::Persist => "persist",
+                    _ => "command",
+                }));
+            }
+            let key = part_to_bytes(&parts[1])?;
+            validate_user_key(&key)?;
+            Ok(Command::new(
+                op,
+                vec![key],
+                None,
+                command_args(&parts).ok_or(ParseError::Protocol("invalid argument"))?,
+            ))
         }
         OpCode::Ping
         | OpCode::Multi
@@ -714,6 +887,11 @@ fn write_parse_error<W: Write>(w: &mut W, err: ParseError) -> std::io::Result<()
     match err {
         ParseError::Protocol(msg) => {
             w.write_all(b"-ERR protocol error: ")?;
+            w.write_all(msg.as_bytes())?;
+            w.write_all(b"\r\n")
+        }
+        ParseError::Error(msg) => {
+            w.write_all(b"-ERR ")?;
             w.write_all(msg.as_bytes())?;
             w.write_all(b"\r\n")
         }
@@ -923,6 +1101,59 @@ fn build_txn_ops(commands: &[Command]) -> (Vec<TxnOperation>, Vec<(usize, usize)
                     group_id: 0,
                 });
             }
+            OpCode::Expire | OpCode::PExpire | OpCode::ExpireAt | OpCode::PExpireAt => {
+                let Some(key) = cmd.keys.first() else {
+                    spans.push((start, 0));
+                    continue;
+                };
+                ops.push(TxnOperation {
+                    op: TXN_OP_EXPIRE,
+                    key_ptr: key.as_ptr(),
+                    key_len: key.len(),
+                    val_ptr: std::ptr::null(),
+                    val_len: 0,
+                    flags: cmd.expire_flags,
+                    expire_at_ms: cmd.expire_at_ms,
+                    group_id: 0,
+                });
+            }
+            OpCode::Ttl | OpCode::PTtl => {
+                let Some(key) = cmd.keys.first() else {
+                    spans.push((start, 0));
+                    continue;
+                };
+                let flags = if cmd.op == OpCode::PTtl {
+                    TXN_FLAG_TTL_MILLISECONDS
+                } else {
+                    0
+                };
+                ops.push(TxnOperation {
+                    op: TXN_OP_TTL,
+                    key_ptr: key.as_ptr(),
+                    key_len: key.len(),
+                    val_ptr: std::ptr::null(),
+                    val_len: 0,
+                    flags,
+                    expire_at_ms: -1,
+                    group_id: 0,
+                });
+            }
+            OpCode::Persist => {
+                let Some(key) = cmd.keys.first() else {
+                    spans.push((start, 0));
+                    continue;
+                };
+                ops.push(TxnOperation {
+                    op: TXN_OP_PERSIST,
+                    key_ptr: key.as_ptr(),
+                    key_len: key.len(),
+                    val_ptr: std::ptr::null(),
+                    val_len: 0,
+                    flags: 0,
+                    expire_at_ms: -1,
+                    group_id: 0,
+                });
+            }
             _ => {}
         }
         spans.push((start, ops.len() - start));
@@ -945,6 +1176,11 @@ fn command_needs_retry(cmd: &Command) -> bool {
             | OpCode::Decr
             | OpCode::DecrBy
             | OpCode::IncrByFloat
+            | OpCode::Expire
+            | OpCode::PExpire
+            | OpCode::ExpireAt
+            | OpCode::PExpireAt
+            | OpCode::Persist
     )
 }
 
@@ -1223,7 +1459,14 @@ fn write_command_result<W: Write>(
         | OpCode::Incr
         | OpCode::IncrBy
         | OpCode::Decr
-        | OpCode::DecrBy => {
+        | OpCode::DecrBy
+        | OpCode::Expire
+        | OpCode::PExpire
+        | OpCode::ExpireAt
+        | OpCode::PExpireAt
+        | OpCode::Ttl
+        | OpCode::PTtl
+        | OpCode::Persist => {
             if first.success {
                 write_integer(writer, first.int_value)?;
             } else {
@@ -1915,7 +2158,14 @@ fn handle_command<W: Write>(
         | OpCode::IncrBy
         | OpCode::Decr
         | OpCode::DecrBy
-        | OpCode::IncrByFloat => {
+        | OpCode::IncrByFloat
+        | OpCode::Expire
+        | OpCode::PExpire
+        | OpCode::ExpireAt
+        | OpCode::PExpireAt
+        | OpCode::Ttl
+        | OpCode::PTtl
+        | OpCode::Persist => {
             if txn_state.in_multi {
                 // Queue command for later execution
                 txn_state.queue_command(cmd.clone());
