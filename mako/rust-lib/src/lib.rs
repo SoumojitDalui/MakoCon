@@ -36,6 +36,16 @@ const TXN_OP_EXPIRE: u32 = 9;
 const TXN_OP_TTL: u32 = 10;
 const TXN_OP_PERSIST: u32 = 11;
 const TXN_OP_SCAN: u32 = 12;
+const TXN_OP_SADD: u32 = 13;
+const TXN_OP_SREM: u32 = 14;
+const TXN_OP_SISMEMBER: u32 = 15;
+const TXN_OP_SCARD: u32 = 16;
+const TXN_OP_SMEMBERS: u32 = 17;
+const TXN_OP_SPOP: u32 = 18;
+const TXN_OP_SRANDMEMBER: u32 = 19;
+const TXN_OP_SMOVE: u32 = 20;
+const TXN_OP_SET_ALGEBRA: u32 = 21;
+const TXN_OP_TYPE: u32 = 22;
 
 const TXN_FLAG_SET_NX: u32 = 1 << 0;
 const TXN_FLAG_SET_XX: u32 = 1 << 1;
@@ -49,6 +59,11 @@ const TXN_FLAG_EXPIRE_XX: u32 = 1 << 8;
 const TXN_FLAG_EXPIRE_GT: u32 = 1 << 9;
 const TXN_FLAG_EXPIRE_LT: u32 = 1 << 10;
 const TXN_FLAG_SCAN_COUNT_ONLY: u32 = 1 << 11;
+const TXN_FLAG_SET_COUNT_GIVEN: u32 = 1 << 12;
+const TXN_FLAG_SET_ALLOW_DUPLICATES: u32 = 1 << 13;
+const TXN_FLAG_SET_ALGEBRA_UNION: u32 = 1 << 14;
+const TXN_FLAG_SET_ALGEBRA_DIFF: u32 = 1 << 15;
+const TXN_FLAG_SET_ALGEBRA_STORE: u32 = 1 << 16;
 
 #[repr(C)]
 struct TxnOperation {
@@ -181,6 +196,20 @@ enum OpCode {
     HScan = 41,
     Type = 42,
     Wait = 43,
+    SAdd = 44,
+    SMembers = 45,
+    SIsMember = 46,
+    SRem = 47,
+    SCard = 48,
+    SMove = 49,
+    SPop = 50,
+    SRandMember = 51,
+    SInter = 52,
+    SUnion = 53,
+    SDiff = 54,
+    SInterStore = 55,
+    SUnionStore = 56,
+    SDiffStore = 57,
 }
 
 #[derive(Copy, Clone, PartialEq)]
@@ -206,6 +235,7 @@ struct Command {
     scan_count: i64,
     scan_prefix: Bytes,
     scan_type_matches: bool,
+    set_count: Option<i64>,
 }
 
 impl Command {
@@ -225,6 +255,7 @@ impl Command {
             scan_count: 10,
             scan_prefix: Bytes::new(),
             scan_type_matches: true,
+            set_count: None,
         }
     }
 }
@@ -370,6 +401,34 @@ fn parse_opcode(name: &[u8]) -> Option<OpCode> {
         Some(OpCode::Type)
     } else if ascii_eq_ci(name, b"WAIT") {
         Some(OpCode::Wait)
+    } else if ascii_eq_ci(name, b"SADD") {
+        Some(OpCode::SAdd)
+    } else if ascii_eq_ci(name, b"SMEMBERS") {
+        Some(OpCode::SMembers)
+    } else if ascii_eq_ci(name, b"SISMEMBER") {
+        Some(OpCode::SIsMember)
+    } else if ascii_eq_ci(name, b"SREM") {
+        Some(OpCode::SRem)
+    } else if ascii_eq_ci(name, b"SCARD") {
+        Some(OpCode::SCard)
+    } else if ascii_eq_ci(name, b"SMOVE") {
+        Some(OpCode::SMove)
+    } else if ascii_eq_ci(name, b"SPOP") {
+        Some(OpCode::SPop)
+    } else if ascii_eq_ci(name, b"SRANDMEMBER") {
+        Some(OpCode::SRandMember)
+    } else if ascii_eq_ci(name, b"SINTER") {
+        Some(OpCode::SInter)
+    } else if ascii_eq_ci(name, b"SUNION") {
+        Some(OpCode::SUnion)
+    } else if ascii_eq_ci(name, b"SDIFF") {
+        Some(OpCode::SDiff)
+    } else if ascii_eq_ci(name, b"SINTERSTORE") {
+        Some(OpCode::SInterStore)
+    } else if ascii_eq_ci(name, b"SUNIONSTORE") {
+        Some(OpCode::SUnionStore)
+    } else if ascii_eq_ci(name, b"SDIFFSTORE") {
+        Some(OpCode::SDiffStore)
     } else if ascii_eq_ci(name, b"DEL") {
         Some(OpCode::Del)
     } else if ascii_eq_ci(name, b"UNLINK") {
@@ -542,6 +601,12 @@ fn parse_positive_i64(arg: &[u8]) -> Result<i64, ParseError> {
     } else {
         Ok(value)
     }
+}
+
+fn parse_i64_arg(arg: &[u8]) -> Result<i64, ParseError> {
+    let text = std::str::from_utf8(arg).map_err(|_| ParseError::Protocol("invalid argument"))?;
+    text.parse()
+        .map_err(|_| ParseError::Protocol("invalid argument"))
 }
 
 fn literal_prefix(pattern: &[u8]) -> Bytes {
@@ -1096,6 +1161,154 @@ fn parse_resp3(frame: DecodedFrame<BytesFrame>) -> Result<Command, ParseError> {
                 command_args(&parts).ok_or(ParseError::Protocol("invalid argument"))?,
             ))
         }
+        OpCode::SAdd | OpCode::SRem => {
+            if parts.len() < 3 {
+                return Err(wrong_arity(if op == OpCode::SAdd {
+                    "sadd"
+                } else {
+                    "srem"
+                }));
+            }
+            let key = part_to_bytes(&parts[1])?;
+            validate_user_key(&key)?;
+            let mut members = Vec::with_capacity(parts.len() - 2);
+            for part in parts.iter().skip(2) {
+                members.push(part_to_bytes(part)?);
+            }
+            let mut cmd = Command::new(
+                op,
+                vec![key],
+                None,
+                command_args(&parts).ok_or(ParseError::Protocol("invalid argument"))?,
+            );
+            cmd.values = members;
+            Ok(cmd)
+        }
+        OpCode::SMembers | OpCode::SCard => {
+            if parts.len() != 2 {
+                return Err(wrong_arity(if op == OpCode::SMembers {
+                    "smembers"
+                } else {
+                    "scard"
+                }));
+            }
+            let key = part_to_bytes(&parts[1])?;
+            validate_user_key(&key)?;
+            Ok(Command::new(
+                op,
+                vec![key],
+                None,
+                command_args(&parts).ok_or(ParseError::Protocol("invalid argument"))?,
+            ))
+        }
+        OpCode::SIsMember => {
+            if parts.len() != 3 {
+                return Err(wrong_arity("sismember"));
+            }
+            let key = part_to_bytes(&parts[1])?;
+            validate_user_key(&key)?;
+            let member = part_to_bytes(&parts[2])?;
+            Ok(Command::new(
+                op,
+                vec![key],
+                Some(member),
+                command_args(&parts).ok_or(ParseError::Protocol("invalid argument"))?,
+            ))
+        }
+        OpCode::SMove => {
+            if parts.len() != 4 {
+                return Err(wrong_arity("smove"));
+            }
+            let source = part_to_bytes(&parts[1])?;
+            let destination = part_to_bytes(&parts[2])?;
+            validate_user_key(&source)?;
+            validate_user_key(&destination)?;
+            let member = part_to_bytes(&parts[3])?;
+            let mut cmd = Command::new(
+                op,
+                vec![source, destination],
+                Some(member),
+                command_args(&parts).ok_or(ParseError::Protocol("invalid argument"))?,
+            );
+            cmd.values = vec![cmd.keys[1].clone(), cmd.val.clone().unwrap()];
+            Ok(cmd)
+        }
+        OpCode::SPop | OpCode::SRandMember => {
+            if parts.len() < 2 || parts.len() > 3 {
+                return Err(wrong_arity(if op == OpCode::SPop {
+                    "spop"
+                } else {
+                    "srandmember"
+                }));
+            }
+            let key = part_to_bytes(&parts[1])?;
+            validate_user_key(&key)?;
+            let mut cmd = Command::new(
+                op,
+                vec![key],
+                None,
+                command_args(&parts).ok_or(ParseError::Protocol("invalid argument"))?,
+            );
+            if parts.len() == 3 {
+                let count_arg = part_to_bytes(&parts[2])?;
+                let count = parse_i64_arg(count_arg.as_ref())?;
+                if op == OpCode::SPop && count < 0 {
+                    return Err(ParseError::Protocol("value is out of range"));
+                }
+                if count == i64::MIN || count.saturating_abs() > SET_RANDOM_COUNT_LIMIT {
+                    return Err(ParseError::Protocol("value is out of range"));
+                }
+                cmd.set_count = Some(count);
+            }
+            Ok(cmd)
+        }
+        OpCode::SInter | OpCode::SUnion | OpCode::SDiff => {
+            if parts.len() < 2 {
+                return Err(wrong_arity(match op {
+                    OpCode::SInter => "sinter",
+                    OpCode::SUnion => "sunion",
+                    OpCode::SDiff => "sdiff",
+                    _ => "setop",
+                }));
+            }
+            let mut keys = Vec::with_capacity(parts.len() - 1);
+            for part in parts.iter().skip(1) {
+                let key = part_to_bytes(part)?;
+                validate_user_key(&key)?;
+                keys.push(key);
+            }
+            Ok(Command::new(
+                op,
+                keys,
+                None,
+                command_args(&parts).ok_or(ParseError::Protocol("invalid argument"))?,
+            ))
+        }
+        OpCode::SInterStore | OpCode::SUnionStore | OpCode::SDiffStore => {
+            if parts.len() < 3 {
+                return Err(wrong_arity(match op {
+                    OpCode::SInterStore => "sinterstore",
+                    OpCode::SUnionStore => "sunionstore",
+                    OpCode::SDiffStore => "sdiffstore",
+                    _ => "setopstore",
+                }));
+            }
+            let destination = part_to_bytes(&parts[1])?;
+            validate_user_key(&destination)?;
+            let mut keys = Vec::with_capacity(parts.len() - 1);
+            keys.push(destination);
+            for part in parts.iter().skip(2) {
+                let key = part_to_bytes(part)?;
+                validate_user_key(&key)?;
+                keys.push(key);
+            }
+            Ok(Command::new(
+                op,
+                keys,
+                None,
+                command_args(&parts).ok_or(ParseError::Protocol("invalid argument"))?,
+            ))
+        }
         OpCode::Ping
         | OpCode::Multi
         | OpCode::Exec
@@ -1261,6 +1474,41 @@ fn read_u64_le(input: &[u8], pos: &mut usize) -> Option<u64> {
     Some(value)
 }
 
+fn append_u64_le(out: &mut Vec<u8>, value: u64) {
+    for shift in (0..64).step_by(8) {
+        out.push(((value >> shift) & 0xff) as u8);
+    }
+}
+
+fn pack_bytes_list(items: &[Bytes]) -> Bytes {
+    let mut out = Vec::new();
+    append_u64_le(&mut out, items.len() as u64);
+    for item in items {
+        append_u64_le(&mut out, item.len() as u64);
+        out.extend_from_slice(item);
+    }
+    Bytes::from(out)
+}
+
+fn parse_list_payload(input: &[u8]) -> Option<Vec<Vec<u8>>> {
+    let mut pos = 0usize;
+    let item_count = read_u64_le(input, &mut pos)? as usize;
+    let mut items = Vec::with_capacity(item_count);
+    for _ in 0..item_count {
+        let item_len = read_u64_le(input, &mut pos)? as usize;
+        if input.len().saturating_sub(pos) < item_len {
+            return None;
+        }
+        items.push(input[pos..pos + item_len].to_vec());
+        pos += item_len;
+    }
+    if pos == input.len() {
+        Some(items)
+    } else {
+        None
+    }
+}
+
 fn parse_scan_payload(input: &[u8]) -> Option<(Vec<u8>, Vec<Vec<u8>>)> {
     let mut pos = 0usize;
     let cursor_len = read_u64_le(input, &mut pos)? as usize;
@@ -1318,9 +1566,10 @@ fn write_keys_array<W: Write>(
 /// One Redis command can expand to multiple FFI operations. Variadic
 /// DEL/UNLINK/EXISTS become one operation per key, then Rust aggregates
 /// value_present back into one Redis integer reply.
-fn build_txn_ops(commands: &[Command]) -> (Vec<TxnOperation>, Vec<(usize, usize)>) {
+fn build_txn_ops(commands: &[Command]) -> (Vec<TxnOperation>, Vec<(usize, usize)>, Vec<Bytes>) {
     let mut ops = Vec::new();
     let mut spans = Vec::with_capacity(commands.len());
+    let mut payloads = Vec::new();
     let mut next_group_id = 1u32;
 
     for cmd in commands {
@@ -1559,7 +1808,7 @@ fn build_txn_ops(commands: &[Command]) -> (Vec<TxnOperation>, Vec<(usize, usize)
                     continue;
                 };
                 ops.push(TxnOperation {
-                    op: TXN_OP_EXISTS,
+                    op: TXN_OP_TYPE,
                     key_ptr: key.as_ptr(),
                     key_len: key.len(),
                     val_ptr: std::ptr::null(),
@@ -1569,12 +1818,169 @@ fn build_txn_ops(commands: &[Command]) -> (Vec<TxnOperation>, Vec<(usize, usize)
                     group_id: 0,
                 });
             }
+            OpCode::SAdd | OpCode::SRem => {
+                let Some(key) = cmd.keys.first() else {
+                    spans.push((start, 0));
+                    continue;
+                };
+                let payload = pack_bytes_list(&cmd.values);
+                payloads.push(payload);
+                let payload = payloads.last().unwrap();
+                let op = if cmd.op == OpCode::SAdd {
+                    TXN_OP_SADD
+                } else {
+                    TXN_OP_SREM
+                };
+                ops.push(TxnOperation {
+                    op,
+                    key_ptr: key.as_ptr(),
+                    key_len: key.len(),
+                    val_ptr: payload.as_ptr(),
+                    val_len: payload.len(),
+                    flags: 0,
+                    expire_at_ms: -1,
+                    group_id: 0,
+                });
+            }
+            OpCode::SIsMember => {
+                let Some(key) = cmd.keys.first() else {
+                    spans.push((start, 0));
+                    continue;
+                };
+                let Some(member) = cmd.val.as_ref() else {
+                    spans.push((start, 0));
+                    continue;
+                };
+                ops.push(TxnOperation {
+                    op: TXN_OP_SISMEMBER,
+                    key_ptr: key.as_ptr(),
+                    key_len: key.len(),
+                    val_ptr: member.as_ptr(),
+                    val_len: member.len(),
+                    flags: 0,
+                    expire_at_ms: -1,
+                    group_id: 0,
+                });
+            }
+            OpCode::SCard | OpCode::SMembers => {
+                let Some(key) = cmd.keys.first() else {
+                    spans.push((start, 0));
+                    continue;
+                };
+                ops.push(TxnOperation {
+                    op: if cmd.op == OpCode::SCard {
+                        TXN_OP_SCARD
+                    } else {
+                        TXN_OP_SMEMBERS
+                    },
+                    key_ptr: key.as_ptr(),
+                    key_len: key.len(),
+                    val_ptr: std::ptr::null(),
+                    val_len: 0,
+                    flags: 0,
+                    expire_at_ms: -1,
+                    group_id: 0,
+                });
+            }
+            OpCode::SMove => {
+                let Some(source) = cmd.keys.first() else {
+                    spans.push((start, 0));
+                    continue;
+                };
+                let payload = pack_bytes_list(&cmd.values);
+                payloads.push(payload);
+                let payload = payloads.last().unwrap();
+                ops.push(TxnOperation {
+                    op: TXN_OP_SMOVE,
+                    key_ptr: source.as_ptr(),
+                    key_len: source.len(),
+                    val_ptr: payload.as_ptr(),
+                    val_len: payload.len(),
+                    flags: 0,
+                    expire_at_ms: -1,
+                    group_id: 0,
+                });
+            }
+            OpCode::SPop | OpCode::SRandMember => {
+                let Some(key) = cmd.keys.first() else {
+                    spans.push((start, 0));
+                    continue;
+                };
+                let mut flags = 0;
+                let mut count = 1;
+                if let Some(raw_count) = cmd.set_count {
+                    flags |= TXN_FLAG_SET_COUNT_GIVEN;
+                    if raw_count < 0 {
+                        flags |= TXN_FLAG_SET_ALLOW_DUPLICATES;
+                        count = raw_count.saturating_abs();
+                    } else {
+                        count = raw_count;
+                    }
+                }
+                ops.push(TxnOperation {
+                    op: if cmd.op == OpCode::SPop {
+                        TXN_OP_SPOP
+                    } else {
+                        TXN_OP_SRANDMEMBER
+                    },
+                    key_ptr: key.as_ptr(),
+                    key_len: key.len(),
+                    val_ptr: std::ptr::null(),
+                    val_len: 0,
+                    flags,
+                    expire_at_ms: count,
+                    group_id: 0,
+                });
+            }
+            OpCode::SInter
+            | OpCode::SUnion
+            | OpCode::SDiff
+            | OpCode::SInterStore
+            | OpCode::SUnionStore
+            | OpCode::SDiffStore => {
+                let Some(key) = cmd.keys.first() else {
+                    spans.push((start, 0));
+                    continue;
+                };
+                let payload = if matches!(
+                    cmd.op,
+                    OpCode::SInterStore | OpCode::SUnionStore | OpCode::SDiffStore
+                ) {
+                    pack_bytes_list(&cmd.keys[1..])
+                } else {
+                    pack_bytes_list(&cmd.keys)
+                };
+                payloads.push(payload);
+                let payload = payloads.last().unwrap();
+                let mut flags = 0;
+                if matches!(cmd.op, OpCode::SUnion | OpCode::SUnionStore) {
+                    flags |= TXN_FLAG_SET_ALGEBRA_UNION;
+                } else if matches!(cmd.op, OpCode::SDiff | OpCode::SDiffStore) {
+                    flags |= TXN_FLAG_SET_ALGEBRA_DIFF;
+                }
+                if matches!(
+                    cmd.op,
+                    OpCode::SInterStore | OpCode::SUnionStore | OpCode::SDiffStore
+                ) {
+                    flags |= TXN_FLAG_SET_ALGEBRA_STORE;
+                }
+                ops.push(TxnOperation {
+                    op: TXN_OP_SET_ALGEBRA,
+                    key_ptr: key.as_ptr(),
+                    key_len: key.len(),
+                    val_ptr: payload.as_ptr(),
+                    val_len: payload.len(),
+                    flags,
+                    expire_at_ms: -1,
+                    group_id: 0,
+                });
+            }
             _ => {}
         }
         spans.push((start, ops.len() - start));
     }
 
-    (ops, spans)
+    (ops, spans, payloads)
 }
 
 fn command_needs_retry(cmd: &Command) -> bool {
@@ -1599,10 +2005,26 @@ fn command_needs_retry(cmd: &Command) -> bool {
             | OpCode::Keys
             | OpCode::Scan
             | OpCode::DbSize
+            | OpCode::Type
+            | OpCode::SAdd
+            | OpCode::SMembers
+            | OpCode::SIsMember
+            | OpCode::SRem
+            | OpCode::SCard
+            | OpCode::SMove
+            | OpCode::SPop
+            | OpCode::SRandMember
+            | OpCode::SInter
+            | OpCode::SUnion
+            | OpCode::SDiff
+            | OpCode::SInterStore
+            | OpCode::SUnionStore
+            | OpCode::SDiffStore
     )
 }
 
 const WRITING_TXN_MAX_ATTEMPTS: usize = 32;
+const SET_RANDOM_COUNT_LIMIT: i64 = 1_000_000;
 
 fn sleep_for_retry(attempt: usize) {
     let delay_ms = match attempt {
@@ -1617,7 +2039,7 @@ fn sleep_for_retry(attempt: usize) {
 /// Returns the result directly without array wrapper
 fn ffi_execute_single<W: Write>(cmd: &Command, writer: &mut W) -> std::io::Result<()> {
     let single = [cmd.clone()];
-    let (ops, spans) = build_txn_ops(&single);
+    let (ops, spans, _payloads) = build_txn_ops(&single);
 
     if ops.is_empty() {
         write_command_result(cmd, None, spans[0], writer)?;
@@ -1679,7 +2101,7 @@ fn ffi_execute_transaction<W: Write>(commands: &[Command], writer: &mut W) -> st
         return Ok(());
     }
 
-    let (ops, spans) = build_txn_ops(commands);
+    let (ops, spans, _payloads) = build_txn_ops(commands);
 
     if ops.is_empty() {
         write_array_header(writer, commands.len())?;
@@ -1904,10 +2326,10 @@ fn write_command_result<W: Write>(
         }
         OpCode::Type => {
             if first.success {
-                if first.value_present {
-                    write_simple_string(writer, "string")?;
-                } else {
-                    write_simple_string(writer, "none")?;
+                match first.int_value {
+                    1 => write_simple_string(writer, "string")?,
+                    2 => write_simple_string(writer, "set")?,
+                    _ => write_simple_string(writer, "none")?,
                 }
             } else {
                 write_err(writer, "operation failed")?;
@@ -1970,6 +2392,64 @@ fn write_command_result<W: Write>(
                 }
             }
             write_integer(writer, count)?;
+        }
+        OpCode::SAdd | OpCode::SRem | OpCode::SCard | OpCode::SIsMember | OpCode::SMove => {
+            if first.success {
+                write_integer(writer, first.int_value)?;
+            } else {
+                write_err(writer, "operation failed")?;
+            }
+        }
+        OpCode::SMembers | OpCode::SInter | OpCode::SUnion | OpCode::SDiff => {
+            if !first.success || !first.value_present || first.data_ptr.is_null() {
+                write_err(writer, "operation failed")?;
+            } else {
+                let data = unsafe { std::slice::from_raw_parts(first.data_ptr, first.data_len) };
+                if let Some(items) = parse_list_payload(data) {
+                    write_array_header(writer, items.len())?;
+                    for item in items {
+                        write_bulk(writer, &item)?;
+                    }
+                } else {
+                    write_err(writer, "operation failed")?;
+                }
+            }
+        }
+        OpCode::SInterStore | OpCode::SUnionStore | OpCode::SDiffStore => {
+            if first.success {
+                write_integer(writer, first.int_value)?;
+            } else {
+                write_err(writer, "operation failed")?;
+            }
+        }
+        OpCode::SPop | OpCode::SRandMember => {
+            if !first.success {
+                write_err(writer, "operation failed")?;
+            } else if !first.value_present {
+                if cmd.set_count.is_some() {
+                    write_array_header(writer, 0)?;
+                } else {
+                    write_nil_bulk(writer)?;
+                }
+            } else if first.data_ptr.is_null() {
+                write_err(writer, "operation failed")?;
+            } else {
+                let data = unsafe { std::slice::from_raw_parts(first.data_ptr, first.data_len) };
+                if let Some(items) = parse_list_payload(data) {
+                    if cmd.set_count.is_some() {
+                        write_array_header(writer, items.len())?;
+                        for item in items {
+                            write_bulk(writer, &item)?;
+                        }
+                    } else if let Some(item) = items.first() {
+                        write_bulk(writer, item)?;
+                    } else {
+                        write_nil_bulk(writer)?;
+                    }
+                } else {
+                    write_err(writer, "operation failed")?;
+                }
+            }
         }
         _ => write_err(writer, "operation failed")?,
     }
@@ -2648,7 +3128,21 @@ fn handle_command<W: Write>(
         | OpCode::Keys
         | OpCode::Scan
         | OpCode::DbSize
-        | OpCode::Type => {
+        | OpCode::Type
+        | OpCode::SAdd
+        | OpCode::SMembers
+        | OpCode::SIsMember
+        | OpCode::SRem
+        | OpCode::SCard
+        | OpCode::SMove
+        | OpCode::SPop
+        | OpCode::SRandMember
+        | OpCode::SInter
+        | OpCode::SUnion
+        | OpCode::SDiff
+        | OpCode::SInterStore
+        | OpCode::SUnionStore
+        | OpCode::SDiffStore => {
             if txn_state.in_multi {
                 // Queue command for later execution
                 txn_state.queue_command(cmd.clone());
