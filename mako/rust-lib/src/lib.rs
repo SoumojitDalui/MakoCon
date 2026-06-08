@@ -46,6 +46,19 @@ const TXN_OP_SRANDMEMBER: u32 = 19;
 const TXN_OP_SMOVE: u32 = 20;
 const TXN_OP_SET_ALGEBRA: u32 = 21;
 const TXN_OP_TYPE: u32 = 22;
+const TXN_OP_LPUSH: u32 = 23;
+const TXN_OP_RPUSH: u32 = 24;
+const TXN_OP_LPOP: u32 = 25;
+const TXN_OP_RPOP: u32 = 26;
+const TXN_OP_LLEN: u32 = 27;
+const TXN_OP_LINDEX: u32 = 28;
+const TXN_OP_LRANGE: u32 = 29;
+const TXN_OP_LSET: u32 = 30;
+const TXN_OP_LREM: u32 = 31;
+const TXN_OP_LTRIM: u32 = 32;
+const TXN_OP_LINSERT: u32 = 33;
+const TXN_OP_LMOVE: u32 = 34;
+const TXN_OP_LPOS: u32 = 35;
 
 const TXN_FLAG_SET_NX: u32 = 1 << 0;
 const TXN_FLAG_SET_XX: u32 = 1 << 1;
@@ -64,6 +77,11 @@ const TXN_FLAG_SET_ALLOW_DUPLICATES: u32 = 1 << 13;
 const TXN_FLAG_SET_ALGEBRA_UNION: u32 = 1 << 14;
 const TXN_FLAG_SET_ALGEBRA_DIFF: u32 = 1 << 15;
 const TXN_FLAG_SET_ALGEBRA_STORE: u32 = 1 << 16;
+const TXN_FLAG_LIST_PUSH_IF_EXISTS: u32 = 1 << 17;
+const TXN_FLAG_LIST_INSERT_BEFORE: u32 = 1 << 18;
+const TXN_FLAG_LIST_SOURCE_LEFT: u32 = 1 << 19;
+const TXN_FLAG_LIST_DEST_LEFT: u32 = 1 << 20;
+const TXN_FLAG_LIST_COUNT_GIVEN: u32 = 1 << 21;
 
 #[repr(C)]
 struct TxnOperation {
@@ -210,6 +228,22 @@ enum OpCode {
     SInterStore = 55,
     SUnionStore = 56,
     SDiffStore = 57,
+    LPush = 58,
+    RPush = 59,
+    LPop = 60,
+    RPop = 61,
+    LLen = 62,
+    LIndex = 63,
+    LRange = 64,
+    LSet = 65,
+    LRem = 66,
+    LTrim = 67,
+    LInsert = 68,
+    LPushX = 69,
+    RPushX = 70,
+    LMove = 71,
+    RPopLPush = 72,
+    LPos = 73,
 }
 
 #[derive(Copy, Clone, PartialEq)]
@@ -429,6 +463,38 @@ fn parse_opcode(name: &[u8]) -> Option<OpCode> {
         Some(OpCode::SUnionStore)
     } else if ascii_eq_ci(name, b"SDIFFSTORE") {
         Some(OpCode::SDiffStore)
+    } else if ascii_eq_ci(name, b"LPUSH") {
+        Some(OpCode::LPush)
+    } else if ascii_eq_ci(name, b"RPUSH") {
+        Some(OpCode::RPush)
+    } else if ascii_eq_ci(name, b"LPOP") {
+        Some(OpCode::LPop)
+    } else if ascii_eq_ci(name, b"RPOP") {
+        Some(OpCode::RPop)
+    } else if ascii_eq_ci(name, b"LLEN") {
+        Some(OpCode::LLen)
+    } else if ascii_eq_ci(name, b"LINDEX") {
+        Some(OpCode::LIndex)
+    } else if ascii_eq_ci(name, b"LRANGE") {
+        Some(OpCode::LRange)
+    } else if ascii_eq_ci(name, b"LSET") {
+        Some(OpCode::LSet)
+    } else if ascii_eq_ci(name, b"LREM") {
+        Some(OpCode::LRem)
+    } else if ascii_eq_ci(name, b"LTRIM") {
+        Some(OpCode::LTrim)
+    } else if ascii_eq_ci(name, b"LINSERT") {
+        Some(OpCode::LInsert)
+    } else if ascii_eq_ci(name, b"LPUSHX") {
+        Some(OpCode::LPushX)
+    } else if ascii_eq_ci(name, b"RPUSHX") {
+        Some(OpCode::RPushX)
+    } else if ascii_eq_ci(name, b"LMOVE") {
+        Some(OpCode::LMove)
+    } else if ascii_eq_ci(name, b"RPOPLPUSH") {
+        Some(OpCode::RPopLPush)
+    } else if ascii_eq_ci(name, b"LPOS") {
+        Some(OpCode::LPos)
     } else if ascii_eq_ci(name, b"DEL") {
         Some(OpCode::Del)
     } else if ascii_eq_ci(name, b"UNLINK") {
@@ -607,6 +673,16 @@ fn parse_i64_arg(arg: &[u8]) -> Result<i64, ParseError> {
     let text = std::str::from_utf8(arg).map_err(|_| ParseError::Protocol("invalid argument"))?;
     text.parse()
         .map_err(|_| ParseError::Protocol("invalid argument"))
+}
+
+fn parse_list_side(arg: &[u8]) -> Result<bool, ParseError> {
+    if ascii_eq_ci(arg, b"LEFT") {
+        Ok(true)
+    } else if ascii_eq_ci(arg, b"RIGHT") {
+        Ok(false)
+    } else {
+        Err(ParseError::Protocol("syntax error"))
+    }
 }
 
 fn literal_prefix(pattern: &[u8]) -> Bytes {
@@ -1309,6 +1385,216 @@ fn parse_resp3(frame: DecodedFrame<BytesFrame>) -> Result<Command, ParseError> {
                 command_args(&parts).ok_or(ParseError::Protocol("invalid argument"))?,
             ))
         }
+        OpCode::LPush | OpCode::RPush | OpCode::LPushX | OpCode::RPushX => {
+            if parts.len() < 3 {
+                return Err(wrong_arity(match op {
+                    OpCode::LPush => "lpush",
+                    OpCode::RPush => "rpush",
+                    OpCode::LPushX => "lpushx",
+                    OpCode::RPushX => "rpushx",
+                    _ => "push",
+                }));
+            }
+            let key = part_to_bytes(&parts[1])?;
+            validate_user_key(&key)?;
+            let mut values = Vec::with_capacity(parts.len() - 2);
+            for part in parts.iter().skip(2) {
+                values.push(part_to_bytes(part)?);
+            }
+            let mut cmd = Command::new(
+                op,
+                vec![key],
+                None,
+                command_args(&parts).ok_or(ParseError::Protocol("invalid argument"))?,
+            );
+            cmd.values = values;
+            Ok(cmd)
+        }
+        OpCode::LPop | OpCode::RPop => {
+            if parts.len() < 2 || parts.len() > 3 {
+                return Err(wrong_arity(if op == OpCode::LPop {
+                    "lpop"
+                } else {
+                    "rpop"
+                }));
+            }
+            let key = part_to_bytes(&parts[1])?;
+            validate_user_key(&key)?;
+            let mut cmd = Command::new(
+                op,
+                vec![key],
+                None,
+                command_args(&parts).ok_or(ParseError::Protocol("invalid argument"))?,
+            );
+            if parts.len() == 3 {
+                let count_arg = part_to_bytes(&parts[2])?;
+                let count = parse_i64_arg(count_arg.as_ref())?;
+                if count < 0 {
+                    return Err(ParseError::Protocol("value is out of range"));
+                }
+                cmd.set_count = Some(count);
+            }
+            Ok(cmd)
+        }
+        OpCode::LLen => {
+            if parts.len() != 2 {
+                return Err(wrong_arity("llen"));
+            }
+            let key = part_to_bytes(&parts[1])?;
+            validate_user_key(&key)?;
+            Ok(Command::new(
+                op,
+                vec![key],
+                None,
+                command_args(&parts).ok_or(ParseError::Protocol("invalid argument"))?,
+            ))
+        }
+        OpCode::LIndex => {
+            if parts.len() != 3 {
+                return Err(wrong_arity("lindex"));
+            }
+            let key = part_to_bytes(&parts[1])?;
+            validate_user_key(&key)?;
+            let index = part_to_bytes(&parts[2])?;
+            let mut cmd = Command::new(
+                op,
+                vec![key],
+                None,
+                command_args(&parts).ok_or(ParseError::Protocol("invalid argument"))?,
+            );
+            cmd.expire_at_ms = parse_i64_arg(index.as_ref())?;
+            Ok(cmd)
+        }
+        OpCode::LRange | OpCode::LTrim => {
+            if parts.len() != 4 {
+                return Err(wrong_arity(if op == OpCode::LRange {
+                    "lrange"
+                } else {
+                    "ltrim"
+                }));
+            }
+            let key = part_to_bytes(&parts[1])?;
+            validate_user_key(&key)?;
+            let start = part_to_bytes(&parts[2])?;
+            let stop = part_to_bytes(&parts[3])?;
+            parse_i64_arg(start.as_ref())?;
+            parse_i64_arg(stop.as_ref())?;
+            let mut cmd = Command::new(
+                op,
+                vec![key],
+                None,
+                command_args(&parts).ok_or(ParseError::Protocol("invalid argument"))?,
+            );
+            cmd.values = vec![start, stop];
+            Ok(cmd)
+        }
+        OpCode::LSet | OpCode::LRem => {
+            if parts.len() != 4 {
+                return Err(wrong_arity(if op == OpCode::LSet {
+                    "lset"
+                } else {
+                    "lrem"
+                }));
+            }
+            let key = part_to_bytes(&parts[1])?;
+            validate_user_key(&key)?;
+            let number = part_to_bytes(&parts[2])?;
+            parse_i64_arg(number.as_ref())?;
+            let value = part_to_bytes(&parts[3])?;
+            let mut cmd = Command::new(
+                op,
+                vec![key],
+                None,
+                command_args(&parts).ok_or(ParseError::Protocol("invalid argument"))?,
+            );
+            cmd.values = vec![number, value];
+            Ok(cmd)
+        }
+        OpCode::LInsert => {
+            if parts.len() != 5 {
+                return Err(wrong_arity("linsert"));
+            }
+            let key = part_to_bytes(&parts[1])?;
+            validate_user_key(&key)?;
+            let position = part_to_bytes(&parts[2])?;
+            let before = if ascii_eq_ci(position.as_ref(), b"BEFORE") {
+                true
+            } else if ascii_eq_ci(position.as_ref(), b"AFTER") {
+                false
+            } else {
+                return Err(ParseError::Protocol("syntax error"));
+            };
+            let pivot = part_to_bytes(&parts[3])?;
+            let value = part_to_bytes(&parts[4])?;
+            let mut cmd = Command::new(
+                op,
+                vec![key],
+                None,
+                command_args(&parts).ok_or(ParseError::Protocol("invalid argument"))?,
+            );
+            cmd.values = vec![pivot, value];
+            if before {
+                cmd.expire_flags |= TXN_FLAG_LIST_INSERT_BEFORE;
+            }
+            Ok(cmd)
+        }
+        OpCode::LMove => {
+            if parts.len() != 5 {
+                return Err(wrong_arity("lmove"));
+            }
+            let source = part_to_bytes(&parts[1])?;
+            let destination = part_to_bytes(&parts[2])?;
+            validate_user_key(&source)?;
+            validate_user_key(&destination)?;
+            let source_left = parse_list_side(part_to_bytes(&parts[3])?.as_ref())?;
+            let dest_left = parse_list_side(part_to_bytes(&parts[4])?.as_ref())?;
+            let mut cmd = Command::new(
+                op,
+                vec![source],
+                None,
+                command_args(&parts).ok_or(ParseError::Protocol("invalid argument"))?,
+            );
+            cmd.values = vec![destination];
+            if source_left {
+                cmd.expire_flags |= TXN_FLAG_LIST_SOURCE_LEFT;
+            }
+            if dest_left {
+                cmd.expire_flags |= TXN_FLAG_LIST_DEST_LEFT;
+            }
+            Ok(cmd)
+        }
+        OpCode::RPopLPush => {
+            if parts.len() != 3 {
+                return Err(wrong_arity("rpoplpush"));
+            }
+            let source = part_to_bytes(&parts[1])?;
+            let destination = part_to_bytes(&parts[2])?;
+            validate_user_key(&source)?;
+            validate_user_key(&destination)?;
+            let mut cmd = Command::new(
+                op,
+                vec![source],
+                None,
+                command_args(&parts).ok_or(ParseError::Protocol("invalid argument"))?,
+            );
+            cmd.values = vec![destination];
+            cmd.expire_flags |= TXN_FLAG_LIST_DEST_LEFT;
+            Ok(cmd)
+        }
+        OpCode::LPos => {
+            if parts.len() != 3 {
+                return Err(wrong_arity("lpos"));
+            }
+            let key = part_to_bytes(&parts[1])?;
+            validate_user_key(&key)?;
+            let element = part_to_bytes(&parts[2])?;
+            Ok(Command::new(
+                op,
+                vec![key],
+                Some(element),
+                command_args(&parts).ok_or(ParseError::Protocol("invalid argument"))?,
+            ))
+        }
         OpCode::Ping
         | OpCode::Multi
         | OpCode::Exec
@@ -1975,6 +2261,146 @@ fn build_txn_ops(commands: &[Command]) -> (Vec<TxnOperation>, Vec<(usize, usize)
                     group_id: 0,
                 });
             }
+            OpCode::LPush | OpCode::RPush | OpCode::LPushX | OpCode::RPushX => {
+                let Some(key) = cmd.keys.first() else {
+                    spans.push((start, 0));
+                    continue;
+                };
+                let payload = pack_bytes_list(&cmd.values);
+                payloads.push(payload);
+                let payload = payloads.last().unwrap();
+                let mut flags = 0;
+                if matches!(cmd.op, OpCode::LPushX | OpCode::RPushX) {
+                    flags |= TXN_FLAG_LIST_PUSH_IF_EXISTS;
+                }
+                ops.push(TxnOperation {
+                    op: if matches!(cmd.op, OpCode::LPush | OpCode::LPushX) {
+                        TXN_OP_LPUSH
+                    } else {
+                        TXN_OP_RPUSH
+                    },
+                    key_ptr: key.as_ptr(),
+                    key_len: key.len(),
+                    val_ptr: payload.as_ptr(),
+                    val_len: payload.len(),
+                    flags,
+                    expire_at_ms: -1,
+                    group_id: 0,
+                });
+            }
+            OpCode::LPop | OpCode::RPop => {
+                let Some(key) = cmd.keys.first() else {
+                    spans.push((start, 0));
+                    continue;
+                };
+                let mut flags = 0;
+                let mut count = 1;
+                if let Some(raw_count) = cmd.set_count {
+                    flags |= TXN_FLAG_LIST_COUNT_GIVEN;
+                    count = raw_count;
+                }
+                ops.push(TxnOperation {
+                    op: if cmd.op == OpCode::LPop {
+                        TXN_OP_LPOP
+                    } else {
+                        TXN_OP_RPOP
+                    },
+                    key_ptr: key.as_ptr(),
+                    key_len: key.len(),
+                    val_ptr: std::ptr::null(),
+                    val_len: 0,
+                    flags,
+                    expire_at_ms: count,
+                    group_id: 0,
+                });
+            }
+            OpCode::LLen | OpCode::LIndex | OpCode::LRange | OpCode::LTrim | OpCode::LPos => {
+                let Some(key) = cmd.keys.first() else {
+                    spans.push((start, 0));
+                    continue;
+                };
+                let packed_range = if matches!(cmd.op, OpCode::LRange | OpCode::LTrim) {
+                    Some(pack_bytes_list(&cmd.values))
+                } else {
+                    None
+                };
+                if let Some(payload) = packed_range {
+                    payloads.push(payload);
+                }
+                let (val_ptr, val_len) = if matches!(cmd.op, OpCode::LRange | OpCode::LTrim) {
+                    let payload = payloads.last().unwrap();
+                    (payload.as_ptr(), payload.len())
+                } else if cmd.op == OpCode::LPos {
+                    let Some(element) = cmd.val.as_ref() else {
+                        spans.push((start, 0));
+                        continue;
+                    };
+                    (element.as_ptr(), element.len())
+                } else {
+                    (std::ptr::null(), 0)
+                };
+                let op = match cmd.op {
+                    OpCode::LLen => TXN_OP_LLEN,
+                    OpCode::LIndex => TXN_OP_LINDEX,
+                    OpCode::LRange => TXN_OP_LRANGE,
+                    OpCode::LTrim => TXN_OP_LTRIM,
+                    OpCode::LPos => TXN_OP_LPOS,
+                    _ => TXN_OP_LLEN,
+                };
+                ops.push(TxnOperation {
+                    op,
+                    key_ptr: key.as_ptr(),
+                    key_len: key.len(),
+                    val_ptr,
+                    val_len,
+                    flags: 0,
+                    expire_at_ms: cmd.expire_at_ms,
+                    group_id: 0,
+                });
+            }
+            OpCode::LSet | OpCode::LRem | OpCode::LInsert => {
+                let Some(key) = cmd.keys.first() else {
+                    spans.push((start, 0));
+                    continue;
+                };
+                let payload = pack_bytes_list(&cmd.values);
+                payloads.push(payload);
+                let payload = payloads.last().unwrap();
+                ops.push(TxnOperation {
+                    op: match cmd.op {
+                        OpCode::LSet => TXN_OP_LSET,
+                        OpCode::LRem => TXN_OP_LREM,
+                        OpCode::LInsert => TXN_OP_LINSERT,
+                        _ => TXN_OP_LSET,
+                    },
+                    key_ptr: key.as_ptr(),
+                    key_len: key.len(),
+                    val_ptr: payload.as_ptr(),
+                    val_len: payload.len(),
+                    flags: cmd.expire_flags,
+                    expire_at_ms: -1,
+                    group_id: 0,
+                });
+            }
+            OpCode::LMove | OpCode::RPopLPush => {
+                let Some(source) = cmd.keys.first() else {
+                    spans.push((start, 0));
+                    continue;
+                };
+                let payload = pack_bytes_list(&cmd.values);
+                payloads.push(payload);
+                let payload = payloads.last().unwrap();
+                ops.push(TxnOperation {
+                    op: TXN_OP_LMOVE,
+                    key_ptr: source.as_ptr(),
+                    key_len: source.len(),
+                    val_ptr: payload.as_ptr(),
+                    val_len: payload.len(),
+                    flags: cmd.expire_flags,
+                    expire_at_ms: -1,
+                    group_id: 0,
+                });
+            }
             _ => {}
         }
         spans.push((start, ops.len() - start));
@@ -2020,6 +2446,22 @@ fn command_needs_retry(cmd: &Command) -> bool {
             | OpCode::SInterStore
             | OpCode::SUnionStore
             | OpCode::SDiffStore
+            | OpCode::LPush
+            | OpCode::RPush
+            | OpCode::LPop
+            | OpCode::RPop
+            | OpCode::LLen
+            | OpCode::LIndex
+            | OpCode::LRange
+            | OpCode::LSet
+            | OpCode::LRem
+            | OpCode::LTrim
+            | OpCode::LInsert
+            | OpCode::LPushX
+            | OpCode::RPushX
+            | OpCode::LMove
+            | OpCode::RPopLPush
+            | OpCode::LPos
     )
 }
 
@@ -2329,6 +2771,7 @@ fn write_command_result<W: Write>(
                 match first.int_value {
                     1 => write_simple_string(writer, "string")?,
                     2 => write_simple_string(writer, "set")?,
+                    3 => write_simple_string(writer, "list")?,
                     _ => write_simple_string(writer, "none")?,
                 }
             } else {
@@ -2449,6 +2892,98 @@ fn write_command_result<W: Write>(
                 } else {
                     write_err(writer, "operation failed")?;
                 }
+            }
+        }
+        OpCode::LPush
+        | OpCode::RPush
+        | OpCode::LPushX
+        | OpCode::RPushX
+        | OpCode::LLen
+        | OpCode::LRem
+        | OpCode::LInsert => {
+            if first.success {
+                write_integer(writer, first.int_value)?;
+            } else {
+                write_err(writer, "operation failed")?;
+            }
+        }
+        OpCode::LSet | OpCode::LTrim => {
+            if first.success {
+                write_simple_ok(writer)?;
+            } else {
+                write_err(writer, "operation failed")?;
+            }
+        }
+        OpCode::LIndex | OpCode::LMove | OpCode::RPopLPush => {
+            if !first.success {
+                write_err(writer, "operation failed")?;
+            } else if first.value_present {
+                if first.data_len > 0 {
+                    if first.data_ptr.is_null() {
+                        write_err(writer, "operation failed")?;
+                    } else {
+                        let data =
+                            unsafe { std::slice::from_raw_parts(first.data_ptr, first.data_len) };
+                        write_bulk(writer, data)?;
+                    }
+                } else {
+                    write_bulk(writer, b"")?;
+                }
+            } else {
+                write_nil_bulk(writer)?;
+            }
+        }
+        OpCode::LPop | OpCode::RPop => {
+            if !first.success {
+                write_err(writer, "operation failed")?;
+            } else if !first.value_present {
+                if cmd.set_count.is_some() {
+                    write_array_header(writer, 0)?;
+                } else {
+                    write_nil_bulk(writer)?;
+                }
+            } else if first.data_ptr.is_null() {
+                write_err(writer, "operation failed")?;
+            } else {
+                let data = unsafe { std::slice::from_raw_parts(first.data_ptr, first.data_len) };
+                if let Some(items) = parse_list_payload(data) {
+                    if cmd.set_count.is_some() {
+                        write_array_header(writer, items.len())?;
+                        for item in items {
+                            write_bulk(writer, &item)?;
+                        }
+                    } else if let Some(item) = items.first() {
+                        write_bulk(writer, item)?;
+                    } else {
+                        write_nil_bulk(writer)?;
+                    }
+                } else {
+                    write_err(writer, "operation failed")?;
+                }
+            }
+        }
+        OpCode::LRange => {
+            if !first.success || !first.value_present || first.data_ptr.is_null() {
+                write_err(writer, "operation failed")?;
+            } else {
+                let data = unsafe { std::slice::from_raw_parts(first.data_ptr, first.data_len) };
+                if let Some(items) = parse_list_payload(data) {
+                    write_array_header(writer, items.len())?;
+                    for item in items {
+                        write_bulk(writer, &item)?;
+                    }
+                } else {
+                    write_err(writer, "operation failed")?;
+                }
+            }
+        }
+        OpCode::LPos => {
+            if !first.success {
+                write_err(writer, "operation failed")?;
+            } else if first.value_present {
+                write_integer(writer, first.int_value)?;
+            } else {
+                write_nil_bulk(writer)?;
             }
         }
         _ => write_err(writer, "operation failed")?,
@@ -3142,7 +3677,23 @@ fn handle_command<W: Write>(
         | OpCode::SDiff
         | OpCode::SInterStore
         | OpCode::SUnionStore
-        | OpCode::SDiffStore => {
+        | OpCode::SDiffStore
+        | OpCode::LPush
+        | OpCode::RPush
+        | OpCode::LPop
+        | OpCode::RPop
+        | OpCode::LLen
+        | OpCode::LIndex
+        | OpCode::LRange
+        | OpCode::LSet
+        | OpCode::LRem
+        | OpCode::LTrim
+        | OpCode::LInsert
+        | OpCode::LPushX
+        | OpCode::RPushX
+        | OpCode::LMove
+        | OpCode::RPopLPush
+        | OpCode::LPos => {
             if txn_state.in_multi {
                 // Queue command for later execution
                 txn_state.queue_command(cmd.clone());
