@@ -1,12 +1,14 @@
 use bytes::Bytes;
 use redis_protocol::resp3::{types::BytesFrame, types::DecodedFrame};
 use socket2::{Domain, Protocol, Socket, Type};
+use std::collections::HashMap;
 use std::env;
 use std::io::{ErrorKind, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::sync::Barrier;
+use std::sync::{Mutex, OnceLock};
 
 mod resp3_handler;
 use resp3_handler::Resp3Handler;
@@ -14,6 +16,8 @@ use resp3_handler::Resp3Handler;
 static CONNECTED_CLIENTS: AtomicUsize = AtomicUsize::new(0);
 static TOTAL_CONNECTIONS_RECEIVED: AtomicUsize = AtomicUsize::new(0);
 static NEXT_CLIENT_ID: AtomicUsize = AtomicUsize::new(1);
+static NEXT_SCAN_CURSOR_ID: AtomicUsize = AtomicUsize::new(1);
+static SCAN_CURSORS: OnceLock<Mutex<HashMap<usize, Bytes>>> = OnceLock::new();
 
 // ===== FFI Types (must match transaction_ffi.h) =====
 // Redis-visible keys must not use the 0x01 prefix. The C++ executor stores
@@ -31,6 +35,7 @@ const TXN_OP_INCRBYFLOAT: u32 = 8;
 const TXN_OP_EXPIRE: u32 = 9;
 const TXN_OP_TTL: u32 = 10;
 const TXN_OP_PERSIST: u32 = 11;
+const TXN_OP_SCAN: u32 = 12;
 
 const TXN_FLAG_SET_NX: u32 = 1 << 0;
 const TXN_FLAG_SET_XX: u32 = 1 << 1;
@@ -43,6 +48,7 @@ const TXN_FLAG_EXPIRE_NX: u32 = 1 << 7;
 const TXN_FLAG_EXPIRE_XX: u32 = 1 << 8;
 const TXN_FLAG_EXPIRE_GT: u32 = 1 << 9;
 const TXN_FLAG_EXPIRE_LT: u32 = 1 << 10;
+const TXN_FLAG_SCAN_COUNT_ONLY: u32 = 1 << 11;
 
 #[repr(C)]
 struct TxnOperation {
@@ -169,6 +175,12 @@ enum OpCode {
     Ttl = 35,
     PTtl = 36,
     Persist = 37,
+    Keys = 38,
+    Scan = 39,
+    DbSize = 40,
+    HScan = 41,
+    Type = 42,
+    Wait = 43,
 }
 
 #[derive(Copy, Clone, PartialEq)]
@@ -191,6 +203,9 @@ struct Command {
     set_keep_ttl: bool,
     expire_at_ms: i64,
     expire_flags: u32,
+    scan_count: i64,
+    scan_prefix: Bytes,
+    scan_type_matches: bool,
 }
 
 impl Command {
@@ -207,6 +222,9 @@ impl Command {
             set_keep_ttl: false,
             expire_at_ms: -1,
             expire_flags: 0,
+            scan_count: 10,
+            scan_prefix: Bytes::new(),
+            scan_type_matches: true,
         }
     }
 }
@@ -340,6 +358,18 @@ fn parse_opcode(name: &[u8]) -> Option<OpCode> {
         Some(OpCode::PTtl)
     } else if ascii_eq_ci(name, b"PERSIST") {
         Some(OpCode::Persist)
+    } else if ascii_eq_ci(name, b"KEYS") {
+        Some(OpCode::Keys)
+    } else if ascii_eq_ci(name, b"SCAN") {
+        Some(OpCode::Scan)
+    } else if ascii_eq_ci(name, b"DBSIZE") {
+        Some(OpCode::DbSize)
+    } else if ascii_eq_ci(name, b"HSCAN") {
+        Some(OpCode::HScan)
+    } else if ascii_eq_ci(name, b"TYPE") {
+        Some(OpCode::Type)
+    } else if ascii_eq_ci(name, b"WAIT") {
+        Some(OpCode::Wait)
     } else if ascii_eq_ci(name, b"DEL") {
         Some(OpCode::Del)
     } else if ascii_eq_ci(name, b"UNLINK") {
@@ -500,6 +530,183 @@ fn validate_expire_flags(flags: u32) -> Result<(), ParseError> {
         ));
     }
     Ok(())
+}
+
+fn parse_positive_i64(arg: &[u8]) -> Result<i64, ParseError> {
+    let text = std::str::from_utf8(arg).map_err(|_| ParseError::Protocol("invalid argument"))?;
+    let value: i64 = text
+        .parse()
+        .map_err(|_| ParseError::Protocol("invalid argument"))?;
+    if value <= 0 {
+        Err(ParseError::Protocol("invalid argument"))
+    } else {
+        Ok(value)
+    }
+}
+
+fn literal_prefix(pattern: &[u8]) -> Bytes {
+    let mut out = Vec::new();
+    let mut escaped = false;
+    for &byte in pattern {
+        if escaped {
+            out.push(byte);
+            escaped = false;
+        } else if byte == b'\\' {
+            escaped = true;
+        } else if matches!(byte, b'*' | b'?' | b'[') {
+            break;
+        } else {
+            out.push(byte);
+        }
+    }
+    Bytes::from(out)
+}
+
+fn scan_cursor_from_arg(arg: &[u8]) -> Result<Bytes, ParseError> {
+    if arg == b"0" {
+        return Ok(Bytes::new());
+    }
+    let text = std::str::from_utf8(arg).map_err(|_| ParseError::Protocol("invalid cursor"))?;
+    let cursor_id: usize = text
+        .parse()
+        .map_err(|_| ParseError::Protocol("invalid cursor"))?;
+    let cursors = SCAN_CURSORS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut guard = cursors
+        .lock()
+        .map_err(|_| ParseError::Protocol("invalid cursor"))?;
+    guard
+        .remove(&cursor_id)
+        .ok_or(ParseError::Protocol("invalid cursor"))
+}
+
+fn store_scan_cursor(cursor: &[u8]) -> String {
+    if cursor.is_empty() {
+        return "0".to_string();
+    }
+    let id = NEXT_SCAN_CURSOR_ID.fetch_add(1, Ordering::Relaxed);
+    let cursors = SCAN_CURSORS.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Ok(mut guard) = cursors.lock() {
+        guard.insert(id, Bytes::copy_from_slice(cursor));
+        id.to_string()
+    } else {
+        "0".to_string()
+    }
+}
+
+fn glob_class_matches(pattern: &[u8], start: usize, value: u8) -> Option<(bool, usize)> {
+    let mut index = start + 1;
+    if index >= pattern.len() {
+        return None;
+    }
+    let negated = matches!(pattern[index], b'^' | b'!');
+    if negated {
+        index += 1;
+    }
+
+    let mut matched = false;
+    let mut saw_end = false;
+    let mut previous: Option<u8> = None;
+    while index < pattern.len() {
+        let byte = pattern[index];
+        if byte == b']' && previous.is_some() {
+            saw_end = true;
+            index += 1;
+            break;
+        }
+        if byte == b'\\' && index + 1 < pattern.len() {
+            let escaped = pattern[index + 1];
+            if escaped == value {
+                matched = true;
+            }
+            previous = Some(escaped);
+            index += 2;
+            continue;
+        }
+        if byte == b'-'
+            && previous.is_some()
+            && index + 1 < pattern.len()
+            && pattern[index + 1] != b']'
+        {
+            let end = pattern[index + 1];
+            let begin = previous.unwrap();
+            if begin <= value && value <= end {
+                matched = true;
+            }
+            previous = Some(end);
+            index += 2;
+            continue;
+        }
+        if byte == value {
+            matched = true;
+        }
+        previous = Some(byte);
+        index += 1;
+    }
+
+    if saw_end {
+        Some((if negated { !matched } else { matched }, index))
+    } else {
+        None
+    }
+}
+
+fn glob_matches(pattern: &[u8], text: &[u8]) -> bool {
+    let (mut p, mut t) = (0usize, 0usize);
+    let (mut star, mut match_after_star) = (None, 0usize);
+    while t < text.len() {
+        if p < pattern.len() && pattern[p] == b'[' {
+            if let Some((matched, next_p)) = glob_class_matches(pattern, p, text[t]) {
+                if matched {
+                    p = next_p;
+                    t += 1;
+                } else if let Some(star_pos) = star {
+                    p = star_pos + 1;
+                    match_after_star += 1;
+                    t = match_after_star;
+                } else {
+                    return false;
+                }
+            } else if pattern[p] == text[t] {
+                p += 1;
+                t += 1;
+            } else if let Some(star_pos) = star {
+                p = star_pos + 1;
+                match_after_star += 1;
+                t = match_after_star;
+            } else {
+                return false;
+            }
+        } else if p < pattern.len() && pattern[p] == b'\\' && p + 1 < pattern.len() {
+            p += 1;
+            if pattern[p] == text[t] {
+                p += 1;
+                t += 1;
+            } else if let Some(star_pos) = star {
+                p = star_pos + 1;
+                match_after_star += 1;
+                t = match_after_star;
+            } else {
+                return false;
+            }
+        } else if p < pattern.len() && (pattern[p] == b'?' || pattern[p] == text[t]) {
+            p += 1;
+            t += 1;
+        } else if p < pattern.len() && pattern[p] == b'*' {
+            star = Some(p);
+            p += 1;
+            match_after_star = t;
+        } else if let Some(star_pos) = star {
+            p = star_pos + 1;
+            match_after_star += 1;
+            t = match_after_star;
+        } else {
+            return false;
+        }
+    }
+    while p < pattern.len() && pattern[p] == b'*' {
+        p += 1;
+    }
+    p == pattern.len()
 }
 
 /// Parse RESP3 frame into Command
@@ -789,6 +996,106 @@ fn parse_resp3(frame: DecodedFrame<BytesFrame>) -> Result<Command, ParseError> {
                 command_args(&parts).ok_or(ParseError::Protocol("invalid argument"))?,
             ))
         }
+        OpCode::Keys => {
+            if parts.len() != 2 {
+                return Err(wrong_arity("keys"));
+            }
+            let pattern = part_to_bytes(&parts[1])?;
+            let mut cmd = Command::new(
+                op,
+                Vec::new(),
+                Some(pattern),
+                command_args(&parts).ok_or(ParseError::Protocol("invalid argument"))?,
+            );
+            cmd.scan_prefix = literal_prefix(cmd.val.as_ref().unwrap().as_ref());
+            cmd.scan_count = 1_000_000;
+            Ok(cmd)
+        }
+        OpCode::Scan => {
+            if parts.len() < 2 {
+                return Err(wrong_arity("scan"));
+            }
+            let cursor_arg = part_to_bytes(&parts[1])?;
+            let cursor = scan_cursor_from_arg(cursor_arg.as_ref())?;
+            let mut cmd = Command::new(
+                op,
+                vec![cursor],
+                Some(Bytes::from_static(b"*")),
+                command_args(&parts).ok_or(ParseError::Protocol("invalid argument"))?,
+            );
+            let mut index = 2;
+            while index < parts.len() {
+                let option = part_to_bytes(&parts[index])?;
+                if ascii_eq_ci(option.as_ref(), b"MATCH") {
+                    if index + 1 >= parts.len() {
+                        return Err(ParseError::Protocol("syntax error"));
+                    }
+                    cmd.val = Some(part_to_bytes(&parts[index + 1])?);
+                    cmd.scan_prefix = literal_prefix(cmd.val.as_ref().unwrap().as_ref());
+                    index += 2;
+                } else if ascii_eq_ci(option.as_ref(), b"COUNT") {
+                    if index + 1 >= parts.len() {
+                        return Err(ParseError::Protocol("syntax error"));
+                    }
+                    let count_arg = part_to_bytes(&parts[index + 1])?;
+                    cmd.scan_count = parse_positive_i64(count_arg.as_ref())?;
+                    index += 2;
+                } else if ascii_eq_ci(option.as_ref(), b"TYPE") {
+                    if index + 1 >= parts.len() {
+                        return Err(ParseError::Protocol("syntax error"));
+                    }
+                    let type_arg = part_to_bytes(&parts[index + 1])?;
+                    if !ascii_eq_ci(type_arg.as_ref(), b"string") {
+                        cmd.scan_type_matches = false;
+                    }
+                    index += 2;
+                } else {
+                    return Err(ParseError::Protocol("syntax error"));
+                }
+            }
+            if cmd.scan_prefix.is_empty() {
+                cmd.scan_prefix = literal_prefix(cmd.val.as_ref().unwrap().as_ref());
+            }
+            if !cmd.scan_type_matches {
+                cmd.scan_prefix = Bytes::from_static(b"\x01");
+            }
+            Ok(cmd)
+        }
+        OpCode::DbSize => {
+            if parts.len() != 1 {
+                return Err(wrong_arity("dbsize"));
+            }
+            Ok(Command::new(
+                op,
+                Vec::new(),
+                None,
+                command_args(&parts).ok_or(ParseError::Protocol("invalid argument"))?,
+            ))
+        }
+        OpCode::Type => {
+            if parts.len() != 2 {
+                return Err(wrong_arity("type"));
+            }
+            let key = part_to_bytes(&parts[1])?;
+            validate_user_key(&key)?;
+            Ok(Command::new(
+                op,
+                vec![key],
+                None,
+                command_args(&parts).ok_or(ParseError::Protocol("invalid argument"))?,
+            ))
+        }
+        OpCode::HScan => {
+            if parts.len() < 3 {
+                return Err(wrong_arity("hscan"));
+            }
+            Ok(Command::new(
+                op,
+                Vec::new(),
+                None,
+                command_args(&parts).ok_or(ParseError::Protocol("invalid argument"))?,
+            ))
+        }
         OpCode::Ping
         | OpCode::Multi
         | OpCode::Exec
@@ -802,7 +1109,8 @@ fn parse_resp3(frame: DecodedFrame<BytesFrame>) -> Result<Command, ParseError> {
         | OpCode::Select
         | OpCode::Auth
         | OpCode::Echo
-        | OpCode::Info => {
+        | OpCode::Info
+        | OpCode::Wait => {
             let command = match op {
                 OpCode::Ping if parts.len() > 2 => Some("ping"),
                 OpCode::Multi if parts.len() != 1 => Some("multi"),
@@ -814,6 +1122,7 @@ fn parse_resp3(frame: DecodedFrame<BytesFrame>) -> Result<Command, ParseError> {
                 OpCode::Auth if parts.len() != 2 && parts.len() != 3 => Some("auth"),
                 OpCode::Echo if parts.len() != 2 => Some("echo"),
                 OpCode::Info if parts.len() > 2 => Some("info"),
+                OpCode::Wait if parts.len() != 3 => Some("wait"),
                 _ => None,
             };
             if let Some(command) = command {
@@ -938,6 +1247,68 @@ fn parse_protocol_version(arg: &[u8]) -> Option<u8> {
     } else {
         None
     }
+}
+
+fn read_u64_le(input: &[u8], pos: &mut usize) -> Option<u64> {
+    if input.len().saturating_sub(*pos) < 8 {
+        return None;
+    }
+    let mut value = 0u64;
+    for shift in 0..8 {
+        value |= (input[*pos + shift] as u64) << (shift * 8);
+    }
+    *pos += 8;
+    Some(value)
+}
+
+fn parse_scan_payload(input: &[u8]) -> Option<(Vec<u8>, Vec<Vec<u8>>)> {
+    let mut pos = 0usize;
+    let cursor_len = read_u64_le(input, &mut pos)? as usize;
+    if input.len().saturating_sub(pos) < cursor_len {
+        return None;
+    }
+    let cursor = input[pos..pos + cursor_len].to_vec();
+    pos += cursor_len;
+
+    let key_count = read_u64_le(input, &mut pos)? as usize;
+    let mut keys = Vec::with_capacity(key_count);
+    for _ in 0..key_count {
+        let key_len = read_u64_le(input, &mut pos)? as usize;
+        if input.len().saturating_sub(pos) < key_len {
+            return None;
+        }
+        keys.push(input[pos..pos + key_len].to_vec());
+        pos += key_len;
+    }
+    if pos == input.len() {
+        Some((cursor, keys))
+    } else {
+        None
+    }
+}
+
+fn scan_result_from_response(result: &TxnOpResult) -> Option<(Vec<u8>, Vec<Vec<u8>>)> {
+    if !result.success || !result.value_present || result.data_ptr.is_null() {
+        return None;
+    }
+    let data = unsafe { std::slice::from_raw_parts(result.data_ptr, result.data_len) };
+    parse_scan_payload(data)
+}
+
+fn write_keys_array<W: Write>(
+    writer: &mut W,
+    keys: Vec<Vec<u8>>,
+    pattern: &[u8],
+) -> std::io::Result<()> {
+    let matched: Vec<Vec<u8>> = keys
+        .into_iter()
+        .filter(|key| glob_matches(pattern, key))
+        .collect();
+    write_array_header(writer, matched.len())?;
+    for key in matched {
+        write_bulk(writer, &key)?;
+    }
+    Ok(())
 }
 
 // ===== Transaction FFI =====
@@ -1154,6 +1525,50 @@ fn build_txn_ops(commands: &[Command]) -> (Vec<TxnOperation>, Vec<(usize, usize)
                     group_id: 0,
                 });
             }
+            OpCode::Keys | OpCode::Scan => {
+                let cursor = cmd.keys.first();
+                let (key_ptr, key_len) = cursor
+                    .map(|c| (c.as_ptr(), c.len()))
+                    .unwrap_or((std::ptr::null(), 0));
+                ops.push(TxnOperation {
+                    op: TXN_OP_SCAN,
+                    key_ptr,
+                    key_len,
+                    val_ptr: cmd.scan_prefix.as_ptr(),
+                    val_len: cmd.scan_prefix.len(),
+                    flags: 0,
+                    expire_at_ms: cmd.scan_count,
+                    group_id: 0,
+                });
+            }
+            OpCode::DbSize => {
+                ops.push(TxnOperation {
+                    op: TXN_OP_SCAN,
+                    key_ptr: std::ptr::null(),
+                    key_len: 0,
+                    val_ptr: std::ptr::null(),
+                    val_len: 0,
+                    flags: TXN_FLAG_SCAN_COUNT_ONLY,
+                    expire_at_ms: -1,
+                    group_id: 0,
+                });
+            }
+            OpCode::Type => {
+                let Some(key) = cmd.keys.first() else {
+                    spans.push((start, 0));
+                    continue;
+                };
+                ops.push(TxnOperation {
+                    op: TXN_OP_EXISTS,
+                    key_ptr: key.as_ptr(),
+                    key_len: key.len(),
+                    val_ptr: std::ptr::null(),
+                    val_len: 0,
+                    flags: 0,
+                    expire_at_ms: -1,
+                    group_id: 0,
+                });
+            }
             _ => {}
         }
         spans.push((start, ops.len() - start));
@@ -1181,6 +1596,9 @@ fn command_needs_retry(cmd: &Command) -> bool {
             | OpCode::ExpireAt
             | OpCode::PExpireAt
             | OpCode::Persist
+            | OpCode::Keys
+            | OpCode::Scan
+            | OpCode::DbSize
     )
 }
 
@@ -1339,6 +1757,10 @@ fn write_command_result<W: Write>(
         }
         return Ok(());
     }
+    if cmd.op == OpCode::Wait {
+        write_integer(writer, 0)?;
+        return Ok(());
+    }
 
     let Some(response) = response else {
         write_err(writer, "operation failed")?;
@@ -1469,6 +1891,49 @@ fn write_command_result<W: Write>(
         | OpCode::Persist => {
             if first.success {
                 write_integer(writer, first.int_value)?;
+            } else {
+                write_err(writer, "operation failed")?;
+            }
+        }
+        OpCode::DbSize => {
+            if first.success {
+                write_integer(writer, first.int_value)?;
+            } else {
+                write_err(writer, "operation failed")?;
+            }
+        }
+        OpCode::Type => {
+            if first.success {
+                if first.value_present {
+                    write_simple_string(writer, "string")?;
+                } else {
+                    write_simple_string(writer, "none")?;
+                }
+            } else {
+                write_err(writer, "operation failed")?;
+            }
+        }
+        OpCode::Keys => {
+            let pattern = cmd.val.as_ref().map(|v| v.as_ref()).unwrap_or(b"*");
+            if let Some((_, keys)) = scan_result_from_response(first) {
+                write_keys_array(writer, keys, pattern)?;
+            } else {
+                write_err(writer, "operation failed")?;
+            }
+        }
+        OpCode::Scan => {
+            let pattern = cmd.val.as_ref().map(|v| v.as_ref()).unwrap_or(b"*");
+            if let Some((cursor, keys)) = scan_result_from_response(first) {
+                let matched: Vec<Vec<u8>> = keys
+                    .into_iter()
+                    .filter(|key| glob_matches(pattern, key))
+                    .collect();
+                write_array_header(writer, 2)?;
+                write_bulk(writer, store_scan_cursor(&cursor).as_bytes())?;
+                write_array_header(writer, matched.len())?;
+                for key in matched {
+                    write_bulk(writer, &key)?;
+                }
             } else {
                 write_err(writer, "operation failed")?;
             }
@@ -2119,6 +2584,20 @@ fn handle_command<W: Write>(
         OpCode::Info => {
             handle_info(cmd, writer)?;
         }
+        OpCode::Wait => {
+            if txn_state.in_multi {
+                txn_state.queue_command(cmd.clone());
+                write_queued(writer)?;
+            } else {
+                write_integer(writer, 0)?;
+            }
+        }
+        OpCode::HScan => {
+            write_err(
+                writer,
+                "HSCAN requires hash command storage, not implemented",
+            )?;
+        }
         OpCode::Multi => {
             if txn_state.in_multi {
                 write_err(writer, "MULTI calls can not be nested")?;
@@ -2165,7 +2644,11 @@ fn handle_command<W: Write>(
         | OpCode::PExpireAt
         | OpCode::Ttl
         | OpCode::PTtl
-        | OpCode::Persist => {
+        | OpCode::Persist
+        | OpCode::Keys
+        | OpCode::Scan
+        | OpCode::DbSize
+        | OpCode::Type => {
             if txn_state.in_multi {
                 // Queue command for later execution
                 txn_state.queue_command(cmd.clone());
