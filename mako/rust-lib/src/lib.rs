@@ -1,14 +1,12 @@
 use bytes::Bytes;
 use redis_protocol::resp3::{types::BytesFrame, types::DecodedFrame};
 use socket2::{Domain, Protocol, Socket, Type};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::env;
 use std::io::{ErrorKind, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
-use std::sync::Barrier;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Barrier, Mutex, OnceLock, Weak};
 
 mod resp3_handler;
 use resp3_handler::Resp3Handler;
@@ -18,6 +16,7 @@ static TOTAL_CONNECTIONS_RECEIVED: AtomicUsize = AtomicUsize::new(0);
 static NEXT_CLIENT_ID: AtomicUsize = AtomicUsize::new(1);
 static NEXT_SCAN_CURSOR_ID: AtomicUsize = AtomicUsize::new(1);
 static SCAN_CURSORS: OnceLock<Mutex<HashMap<usize, Bytes>>> = OnceLock::new();
+static PUBSUB_REGISTRY: OnceLock<Mutex<PubSubRegistry>> = OnceLock::new();
 
 // ===== FFI Types (must match transaction_ffi.h) =====
 // Redis-visible keys must not use the 0x01 prefix. The C++ executor stores
@@ -277,6 +276,12 @@ enum OpCode {
     ZPopMin = 85,
     ZPopMax = 86,
     ZScan = 87,
+    Subscribe = 88,
+    Unsubscribe = 89,
+    PSubscribe = 90,
+    PUnsubscribe = 91,
+    Publish = 92,
+    PubSub = 93,
 }
 
 #[derive(Copy, Clone, PartialEq)]
@@ -372,12 +377,53 @@ impl TransactionState {
 
 // ===== Client State =====
 
-/// Per-connection client metadata for Redis handshake commands.
+type PubSubQueue = Arc<Mutex<VecDeque<Vec<u8>>>>;
+type PubSubQueueWeak = Weak<Mutex<VecDeque<Vec<u8>>>>;
+
+#[derive(Clone)]
+struct PubSubTarget {
+    client_id: usize,
+    queue: PubSubQueueWeak,
+}
+
+struct PubSubRegistry {
+    channels: HashMap<Bytes, Vec<PubSubTarget>>,
+    patterns: HashMap<Bytes, Vec<PubSubTarget>>,
+}
+
+impl PubSubRegistry {
+    fn new() -> Self {
+        PubSubRegistry {
+            channels: HashMap::new(),
+            patterns: HashMap::new(),
+        }
+    }
+
+    fn prune_dead(&mut self) {
+        self.channels.retain(|_, targets| {
+            targets.retain(|target| target.queue.strong_count() > 0);
+            !targets.is_empty()
+        });
+        self.patterns.retain(|_, targets| {
+            targets.retain(|target| target.queue.strong_count() > 0);
+            !targets.is_empty()
+        });
+    }
+}
+
+fn pubsub_registry() -> &'static Mutex<PubSubRegistry> {
+    PUBSUB_REGISTRY.get_or_init(|| Mutex::new(PubSubRegistry::new()))
+}
+
+/// Per-connection client metadata for Redis handshake and Pub/Sub commands.
 struct ClientState {
     id: usize,
     protocol_version: u8,
     name: Option<Bytes>,
     close_after_reply: bool,
+    subscribed_channels: HashSet<Bytes>,
+    subscribed_patterns: HashSet<Bytes>,
+    pubsub_queue: PubSubQueue,
 }
 
 impl ClientState {
@@ -387,6 +433,9 @@ impl ClientState {
             protocol_version: 2,
             name: None,
             close_after_reply: false,
+            subscribed_channels: HashSet::new(),
+            subscribed_patterns: HashSet::new(),
+            pubsub_queue: Arc::new(Mutex::new(VecDeque::new())),
         }
     }
 
@@ -394,6 +443,19 @@ impl ClientState {
         self.protocol_version = 2;
         self.name = None;
         self.close_after_reply = false;
+        self.subscribed_channels.clear();
+        self.subscribed_patterns.clear();
+        if let Ok(mut queue) = self.pubsub_queue.lock() {
+            queue.clear();
+        }
+    }
+
+    fn subscription_count(&self) -> usize {
+        self.subscribed_channels.len() + self.subscribed_patterns.len()
+    }
+
+    fn in_subscriber_mode(&self) -> bool {
+        self.subscription_count() > 0
     }
 }
 
@@ -556,6 +618,18 @@ fn parse_opcode(name: &[u8]) -> Option<OpCode> {
         Some(OpCode::ZPopMax)
     } else if ascii_eq_ci(name, b"ZSCAN") {
         Some(OpCode::ZScan)
+    } else if ascii_eq_ci(name, b"SUBSCRIBE") {
+        Some(OpCode::Subscribe)
+    } else if ascii_eq_ci(name, b"UNSUBSCRIBE") {
+        Some(OpCode::Unsubscribe)
+    } else if ascii_eq_ci(name, b"PSUBSCRIBE") {
+        Some(OpCode::PSubscribe)
+    } else if ascii_eq_ci(name, b"PUNSUBSCRIBE") {
+        Some(OpCode::PUnsubscribe)
+    } else if ascii_eq_ci(name, b"PUBLISH") {
+        Some(OpCode::Publish)
+    } else if ascii_eq_ci(name, b"PUBSUB") {
+        Some(OpCode::PubSub)
     } else if ascii_eq_ci(name, b"DEL") {
         Some(OpCode::Del)
     } else if ascii_eq_ci(name, b"UNLINK") {
@@ -1964,6 +2038,51 @@ fn parse_resp3(frame: DecodedFrame<BytesFrame>) -> Result<Command, ParseError> {
             }
             Ok(cmd)
         }
+        OpCode::Subscribe | OpCode::PSubscribe => {
+            if parts.len() < 2 {
+                return Err(wrong_arity(if op == OpCode::Subscribe {
+                    "subscribe"
+                } else {
+                    "psubscribe"
+                }));
+            }
+            Ok(Command::new(
+                op,
+                Vec::new(),
+                None,
+                command_args(&parts).ok_or(ParseError::Protocol("invalid argument"))?,
+            ))
+        }
+        OpCode::Unsubscribe | OpCode::PUnsubscribe => Ok(Command::new(
+            op,
+            Vec::new(),
+            None,
+            command_args(&parts).ok_or(ParseError::Protocol("invalid argument"))?,
+        )),
+        OpCode::Publish => {
+            if parts.len() != 3 {
+                return Err(wrong_arity("publish"));
+            }
+            let channel = part_to_bytes(&parts[1])?;
+            let message = part_to_bytes(&parts[2])?;
+            Ok(Command::new(
+                op,
+                vec![channel],
+                Some(message),
+                command_args(&parts).ok_or(ParseError::Protocol("invalid argument"))?,
+            ))
+        }
+        OpCode::PubSub => {
+            if parts.len() < 2 {
+                return Err(wrong_arity("pubsub"));
+            }
+            Ok(Command::new(
+                op,
+                Vec::new(),
+                None,
+                command_args(&parts).ok_or(ParseError::Protocol("invalid argument"))?,
+            ))
+        }
         OpCode::Ping
         | OpCode::Multi
         | OpCode::Exec
@@ -2210,6 +2329,369 @@ fn write_keys_array<W: Write>(
     write_array_header(writer, matched.len())?;
     for key in matched {
         write_bulk(writer, &key)?;
+    }
+    Ok(())
+}
+
+fn make_pubsub_target(client_state: &ClientState) -> PubSubTarget {
+    PubSubTarget {
+        client_id: client_state.id,
+        queue: Arc::downgrade(&client_state.pubsub_queue),
+    }
+}
+
+fn register_pubsub_channel(client_state: &mut ClientState, channel: &Bytes) {
+    if !client_state.subscribed_channels.insert(channel.clone()) {
+        return;
+    }
+    if let Ok(mut registry) = pubsub_registry().lock() {
+        registry
+            .channels
+            .entry(channel.clone())
+            .or_default()
+            .push(make_pubsub_target(client_state));
+    }
+}
+
+fn register_pubsub_pattern(client_state: &mut ClientState, pattern: &Bytes) {
+    if !client_state.subscribed_patterns.insert(pattern.clone()) {
+        return;
+    }
+    if let Ok(mut registry) = pubsub_registry().lock() {
+        registry
+            .patterns
+            .entry(pattern.clone())
+            .or_default()
+            .push(make_pubsub_target(client_state));
+    }
+}
+
+fn remove_pubsub_target(
+    map: &mut HashMap<Bytes, Vec<PubSubTarget>>,
+    name: &Bytes,
+    client_id: usize,
+) {
+    let mut remove_key = false;
+    if let Some(targets) = map.get_mut(name) {
+        targets.retain(|target| target.client_id != client_id && target.queue.strong_count() > 0);
+        remove_key = targets.is_empty();
+    }
+    if remove_key {
+        map.remove(name);
+    }
+}
+
+fn unregister_pubsub_channel(client_state: &mut ClientState, channel: &Bytes) {
+    if !client_state.subscribed_channels.remove(channel) {
+        return;
+    }
+    if let Ok(mut registry) = pubsub_registry().lock() {
+        remove_pubsub_target(&mut registry.channels, channel, client_state.id);
+    }
+}
+
+fn unregister_pubsub_pattern(client_state: &mut ClientState, pattern: &Bytes) {
+    if !client_state.subscribed_patterns.remove(pattern) {
+        return;
+    }
+    if let Ok(mut registry) = pubsub_registry().lock() {
+        remove_pubsub_target(&mut registry.patterns, pattern, client_state.id);
+    }
+}
+
+fn unregister_all_pubsub(client_state: &mut ClientState) {
+    let channels: Vec<Bytes> = client_state.subscribed_channels.iter().cloned().collect();
+    let patterns: Vec<Bytes> = client_state.subscribed_patterns.iter().cloned().collect();
+    for channel in channels {
+        unregister_pubsub_channel(client_state, &channel);
+    }
+    for pattern in patterns {
+        unregister_pubsub_pattern(client_state, &pattern);
+    }
+    if let Ok(mut queue) = client_state.pubsub_queue.lock() {
+        queue.clear();
+    }
+}
+
+fn enqueue_pubsub_reply(
+    target: &PubSubTarget,
+    reply: &[u8],
+    receivers: &mut HashSet<usize>,
+) -> bool {
+    let Some(queue) = target.queue.upgrade() else {
+        return false;
+    };
+    if let Ok(mut queue) = queue.lock() {
+        queue.push_back(reply.to_vec());
+        receivers.insert(target.client_id);
+    }
+    true
+}
+
+fn encode_pubsub_message(channel: &[u8], message: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    write_array_header(&mut out, 3).unwrap();
+    write_bulk(&mut out, b"message").unwrap();
+    write_bulk(&mut out, channel).unwrap();
+    write_bulk(&mut out, message).unwrap();
+    out
+}
+
+fn encode_pubsub_pattern_message(pattern: &[u8], channel: &[u8], message: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    write_array_header(&mut out, 4).unwrap();
+    write_bulk(&mut out, b"pmessage").unwrap();
+    write_bulk(&mut out, pattern).unwrap();
+    write_bulk(&mut out, channel).unwrap();
+    write_bulk(&mut out, message).unwrap();
+    out
+}
+
+fn publish_pubsub_message(channel: &Bytes, message: &Bytes) -> usize {
+    let mut receivers = HashSet::new();
+    let Ok(mut registry) = pubsub_registry().lock() else {
+        return 0;
+    };
+
+    let exact_reply = encode_pubsub_message(channel.as_ref(), message.as_ref());
+    let mut remove_channel = false;
+    if let Some(targets) = registry.channels.get_mut(channel) {
+        targets.retain(|target| enqueue_pubsub_reply(target, &exact_reply, &mut receivers));
+        remove_channel = targets.is_empty();
+    }
+    if remove_channel {
+        registry.channels.remove(channel);
+    }
+
+    let patterns: Vec<Bytes> = registry.patterns.keys().cloned().collect();
+    for pattern in patterns {
+        if !glob_matches(pattern.as_ref(), channel.as_ref()) {
+            continue;
+        }
+        let reply = encode_pubsub_pattern_message(pattern.as_ref(), channel.as_ref(), message);
+        let mut remove_pattern = false;
+        if let Some(targets) = registry.patterns.get_mut(&pattern) {
+            targets.retain(|target| enqueue_pubsub_reply(target, &reply, &mut receivers));
+            remove_pattern = targets.is_empty();
+        }
+        if remove_pattern {
+            registry.patterns.remove(&pattern);
+        }
+    }
+
+    receivers.len()
+}
+
+fn pubsub_channel_names(pattern: Option<&[u8]>) -> Vec<Bytes> {
+    let Ok(mut registry) = pubsub_registry().lock() else {
+        return Vec::new();
+    };
+    registry.prune_dead();
+    let mut channels: Vec<Bytes> = registry
+        .channels
+        .keys()
+        .filter(|channel| pattern.map_or(true, |pat| glob_matches(pat, channel.as_ref())))
+        .cloned()
+        .collect();
+    channels.sort();
+    channels
+}
+
+fn pubsub_numsub(channels: &[Bytes]) -> Vec<(Bytes, usize)> {
+    let Ok(mut registry) = pubsub_registry().lock() else {
+        return channels
+            .iter()
+            .cloned()
+            .map(|channel| (channel, 0))
+            .collect();
+    };
+    registry.prune_dead();
+    channels
+        .iter()
+        .map(|channel| {
+            let count = registry
+                .channels
+                .get(channel)
+                .map(|targets| targets.len())
+                .unwrap_or(0);
+            (channel.clone(), count)
+        })
+        .collect()
+}
+
+fn pubsub_numpat() -> usize {
+    let Ok(mut registry) = pubsub_registry().lock() else {
+        return 0;
+    };
+    registry.prune_dead();
+    registry.patterns.len()
+}
+
+fn pubsub_channel_count() -> usize {
+    let Ok(mut registry) = pubsub_registry().lock() else {
+        return 0;
+    };
+    registry.prune_dead();
+    registry.channels.len()
+}
+
+fn write_pubsub_subscription<W: Write>(
+    writer: &mut W,
+    kind: &[u8],
+    name: Option<&Bytes>,
+    count: usize,
+) -> std::io::Result<()> {
+    write_array_header(writer, 3)?;
+    write_bulk(writer, kind)?;
+    match name {
+        Some(name) => write_bulk(writer, name)?,
+        None => write_nil_bulk(writer)?,
+    }
+    write_integer(writer, count as i64)
+}
+
+fn handle_subscribe<W: Write>(
+    cmd: &Command,
+    client_state: &mut ClientState,
+    writer: &mut W,
+) -> std::io::Result<()> {
+    for channel in &cmd.args {
+        register_pubsub_channel(client_state, channel);
+        write_pubsub_subscription(
+            writer,
+            b"subscribe",
+            Some(channel),
+            client_state.subscription_count(),
+        )?;
+    }
+    Ok(())
+}
+
+fn handle_psubscribe<W: Write>(
+    cmd: &Command,
+    client_state: &mut ClientState,
+    writer: &mut W,
+) -> std::io::Result<()> {
+    for pattern in &cmd.args {
+        register_pubsub_pattern(client_state, pattern);
+        write_pubsub_subscription(
+            writer,
+            b"psubscribe",
+            Some(pattern),
+            client_state.subscription_count(),
+        )?;
+    }
+    Ok(())
+}
+
+fn handle_unsubscribe<W: Write>(
+    cmd: &Command,
+    client_state: &mut ClientState,
+    writer: &mut W,
+) -> std::io::Result<()> {
+    let channels: Vec<Bytes> = if cmd.args.is_empty() {
+        client_state.subscribed_channels.iter().cloned().collect()
+    } else {
+        cmd.args.clone()
+    };
+    if channels.is_empty() {
+        return write_pubsub_subscription(
+            writer,
+            b"unsubscribe",
+            None,
+            client_state.subscription_count(),
+        );
+    }
+    for channel in channels {
+        unregister_pubsub_channel(client_state, &channel);
+        write_pubsub_subscription(
+            writer,
+            b"unsubscribe",
+            Some(&channel),
+            client_state.subscription_count(),
+        )?;
+    }
+    Ok(())
+}
+
+fn handle_punsubscribe<W: Write>(
+    cmd: &Command,
+    client_state: &mut ClientState,
+    writer: &mut W,
+) -> std::io::Result<()> {
+    let patterns: Vec<Bytes> = if cmd.args.is_empty() {
+        client_state.subscribed_patterns.iter().cloned().collect()
+    } else {
+        cmd.args.clone()
+    };
+    if patterns.is_empty() {
+        return write_pubsub_subscription(
+            writer,
+            b"punsubscribe",
+            None,
+            client_state.subscription_count(),
+        );
+    }
+    for pattern in patterns {
+        unregister_pubsub_pattern(client_state, &pattern);
+        write_pubsub_subscription(
+            writer,
+            b"punsubscribe",
+            Some(&pattern),
+            client_state.subscription_count(),
+        )?;
+    }
+    Ok(())
+}
+
+fn handle_publish<W: Write>(cmd: &Command, writer: &mut W) -> std::io::Result<()> {
+    let Some(channel) = cmd.keys.first() else {
+        return write_integer(writer, 0);
+    };
+    let Some(message) = cmd.val.as_ref() else {
+        return write_integer(writer, 0);
+    };
+    write_integer(writer, publish_pubsub_message(channel, message) as i64)
+}
+
+fn handle_pubsub<W: Write>(cmd: &Command, writer: &mut W) -> std::io::Result<()> {
+    let Some(subcommand) = cmd.args.first() else {
+        write_err(writer, "wrong number of arguments for 'pubsub' command")?;
+        return Ok(());
+    };
+    if ascii_eq_ci(subcommand, b"CHANNELS") {
+        if cmd.args.len() > 2 {
+            write_err(
+                writer,
+                "wrong number of arguments for 'pubsub channels' command",
+            )?;
+            return Ok(());
+        }
+        let pattern = cmd.args.get(1).map(|arg| arg.as_ref());
+        let channels = pubsub_channel_names(pattern);
+        write_array_header(writer, channels.len())?;
+        for channel in channels {
+            write_bulk(writer, &channel)?;
+        }
+    } else if ascii_eq_ci(subcommand, b"NUMSUB") {
+        let channels: Vec<Bytes> = cmd.args.iter().skip(1).cloned().collect();
+        let counts = pubsub_numsub(&channels);
+        write_array_header(writer, counts.len() * 2)?;
+        for (channel, count) in counts {
+            write_bulk(writer, &channel)?;
+            write_integer(writer, count as i64)?;
+        }
+    } else if ascii_eq_ci(subcommand, b"NUMPAT") {
+        if cmd.args.len() != 1 {
+            write_err(
+                writer,
+                "wrong number of arguments for 'pubsub numpat' command",
+            )?;
+            return Ok(());
+        }
+        write_integer(writer, pubsub_numpat() as i64)?;
+    } else {
+        write_err(writer, "unsupported PUBSUB subcommand")?;
     }
     Ok(())
 }
@@ -3178,6 +3660,10 @@ fn write_command_result<W: Write>(
         write_integer(writer, 0)?;
         return Ok(());
     }
+    if cmd.op == OpCode::Publish {
+        handle_publish(cmd, writer)?;
+        return Ok(());
+    }
 
     let Some(response) = response else {
         write_err(writer, "operation failed")?;
@@ -3740,6 +4226,7 @@ pub extern "C" fn rust_init(n_threads: usize) -> bool {
                                 idx += 1;
                             }
                             Ok(ClientEvent::Close) => {
+                                unregister_all_pubsub(&mut clients[idx].client_state);
                                 clients.swap_remove(idx);
                                 CONNECTED_CLIENTS.fetch_sub(1, Ordering::Relaxed);
                                 made_progress = true;
@@ -3747,8 +4234,20 @@ pub extern "C" fn rust_init(n_threads: usize) -> bool {
                             Err(e) if e.kind() == ErrorKind::WouldBlock => {
                                 idx += 1;
                             }
+                            Err(e)
+                                if matches!(
+                                    e.kind(),
+                                    ErrorKind::ConnectionReset | ErrorKind::BrokenPipe
+                                ) =>
+                            {
+                                unregister_all_pubsub(&mut clients[idx].client_state);
+                                clients.swap_remove(idx);
+                                CONNECTED_CLIENTS.fetch_sub(1, Ordering::Relaxed);
+                                made_progress = true;
+                            }
                             Err(e) => {
                                 eprintln!("Client handling error: {e}");
+                                unregister_all_pubsub(&mut clients[idx].client_state);
                                 clients.swap_remove(idx);
                                 CONNECTED_CLIENTS.fetch_sub(1, Ordering::Relaxed);
                                 made_progress = true;
@@ -3811,8 +4310,25 @@ fn flush_client(client: &mut ClientConn) -> std::io::Result<bool> {
     Ok(true)
 }
 
+fn drain_pubsub_queue(client: &mut ClientConn) -> bool {
+    let Ok(mut queue) = client.client_state.pubsub_queue.lock() else {
+        return false;
+    };
+    if queue.is_empty() {
+        return false;
+    }
+    while let Some(reply) = queue.pop_front() {
+        client.write_buf.extend_from_slice(&reply);
+    }
+    true
+}
+
 fn service_client(client: &mut ClientConn) -> std::io::Result<ClientEvent> {
     let mut made_progress = false;
+
+    if drain_pubsub_queue(client) {
+        made_progress = true;
+    }
 
     if !client.write_buf.is_empty() {
         if !flush_client(client)? {
@@ -3867,6 +4383,10 @@ fn service_client(client: &mut ClientConn) -> std::io::Result<ClientEvent> {
             Err(e) if e.kind() == ErrorKind::WouldBlock => break,
             Err(e) => return Err(e),
         }
+    }
+
+    if drain_pubsub_queue(client) {
+        made_progress = true;
     }
 
     if !client.write_buf.is_empty() {
@@ -4143,6 +4663,22 @@ fn append_clients_info(out: &mut String) {
     out.push_str("# Clients\r\n");
     out.push_str("connected_clients:");
     out.push_str(&CONNECTED_CLIENTS.load(Ordering::Relaxed).to_string());
+    out.push_str("\r\n");
+    out.push_str("pubsub_channels:");
+    out.push_str(&pubsub_channel_count().to_string());
+    out.push_str("\r\n");
+    out.push_str("pubsub_patterns:");
+    out.push_str(&pubsub_numpat().to_string());
+    out.push_str("\r\n\r\n");
+}
+
+fn append_stats_info(out: &mut String) {
+    out.push_str("# Stats\r\n");
+    out.push_str("pubsub_channels:");
+    out.push_str(&pubsub_channel_count().to_string());
+    out.push_str("\r\n");
+    out.push_str("pubsub_patterns:");
+    out.push_str(&pubsub_numpat().to_string());
     out.push_str("\r\n\r\n");
 }
 
@@ -4171,11 +4707,14 @@ fn handle_info<W: Write>(cmd: &Command, writer: &mut W) -> std::io::Result<()> {
     if ascii_eq_ci(section, b"default") || ascii_eq_ci(section, b"all") {
         append_server_info(&mut out, &metrics);
         append_clients_info(&mut out);
+        append_stats_info(&mut out);
         append_mako_info(&mut out, &metrics);
     } else if ascii_eq_ci(section, b"server") {
         append_server_info(&mut out, &metrics);
     } else if ascii_eq_ci(section, b"clients") {
         append_clients_info(&mut out);
+    } else if ascii_eq_ci(section, b"stats") {
+        append_stats_info(&mut out);
     } else if ascii_eq_ci(section, b"mako") {
         append_mako_info(&mut out, &metrics);
     }
@@ -4190,9 +4729,36 @@ fn handle_command<W: Write>(
     client_state: &mut ClientState,
     writer: &mut W,
 ) -> std::io::Result<()> {
+    if client_state.in_subscriber_mode()
+        && !matches!(
+            cmd.op,
+            OpCode::Subscribe
+                | OpCode::Unsubscribe
+                | OpCode::PSubscribe
+                | OpCode::PUnsubscribe
+                | OpCode::Ping
+                | OpCode::Quit
+                | OpCode::Reset
+        )
+    {
+        write_err(
+            writer,
+            "only (P)SUBSCRIBE, (P)UNSUBSCRIBE, PING, QUIT and RESET are allowed in subscriber mode",
+        )?;
+        return Ok(());
+    }
+
     match cmd.op {
         OpCode::Ping => {
-            if txn_state.in_multi {
+            if client_state.in_subscriber_mode() {
+                write_array_header(writer, 2)?;
+                write_bulk(writer, b"pong")?;
+                if let Some(arg) = cmd.args.first() {
+                    write_bulk(writer, arg)?;
+                } else {
+                    write_bulk(writer, b"")?;
+                }
+            } else if txn_state.in_multi {
                 txn_state.queue_command(cmd.clone());
                 write_queued(writer)?;
             } else {
@@ -4217,10 +4783,12 @@ fn handle_command<W: Write>(
         }
         OpCode::Reset => {
             txn_state.discard();
+            unregister_all_pubsub(client_state);
             client_state.reset();
             write_simple_string(writer, "RESET")?;
         }
         OpCode::Quit => {
+            unregister_all_pubsub(client_state);
             client_state.close_after_reply = true;
             write_simple_ok(writer)?;
         }
@@ -4285,6 +4853,29 @@ fn handle_command<W: Write>(
                 txn_state.discard();
                 write_simple_ok(writer)?;
             }
+        }
+        OpCode::Subscribe => {
+            handle_subscribe(cmd, client_state, writer)?;
+        }
+        OpCode::Unsubscribe => {
+            handle_unsubscribe(cmd, client_state, writer)?;
+        }
+        OpCode::PSubscribe => {
+            handle_psubscribe(cmd, client_state, writer)?;
+        }
+        OpCode::PUnsubscribe => {
+            handle_punsubscribe(cmd, client_state, writer)?;
+        }
+        OpCode::Publish => {
+            if txn_state.in_multi {
+                txn_state.queue_command(cmd.clone());
+                write_queued(writer)?;
+            } else {
+                handle_publish(cmd, writer)?;
+            }
+        }
+        OpCode::PubSub => {
+            handle_pubsub(cmd, writer)?;
         }
         OpCode::Get
         | OpCode::Set
@@ -4788,6 +5379,216 @@ mod tests {
         assert_eq!(multi, b"+OK\r\n");
         assert_eq!(ping, b"+QUEUED\r\n");
         assert_eq!(exec, b"*1\r\n+PONG\r\n");
+    }
+
+    #[test]
+    fn subscribe_publish_enqueues_message() {
+        let mut subscriber_txn = TransactionState::new();
+        let mut subscriber_state = ClientState::new();
+        let channel = Bytes::from(format!("phase9:{}", subscriber_state.id));
+
+        let subscribe = run(
+            Command::new(OpCode::Subscribe, Vec::new(), None, vec![channel.clone()]),
+            &mut subscriber_txn,
+            &mut subscriber_state,
+        );
+        assert_eq!(
+            subscribe,
+            format!(
+                "*3\r\n$9\r\nsubscribe\r\n${}\r\n{}\r\n:1\r\n",
+                channel.len(),
+                String::from_utf8_lossy(&channel)
+            )
+            .into_bytes()
+        );
+
+        let mut publisher_txn = TransactionState::new();
+        let mut publisher_state = ClientState::new();
+        let publish = run(
+            Command::new(
+                OpCode::Publish,
+                vec![channel.clone()],
+                Some(Bytes::from_static(b"hello")),
+                vec![channel.clone(), Bytes::from_static(b"hello")],
+            ),
+            &mut publisher_txn,
+            &mut publisher_state,
+        );
+        assert_eq!(publish, b":1\r\n");
+
+        let message = subscriber_state
+            .pubsub_queue
+            .lock()
+            .unwrap()
+            .pop_front()
+            .unwrap();
+        assert_eq!(
+            message,
+            format!(
+                "*3\r\n$7\r\nmessage\r\n${}\r\n{}\r\n$5\r\nhello\r\n",
+                channel.len(),
+                String::from_utf8_lossy(&channel)
+            )
+            .into_bytes()
+        );
+
+        unregister_all_pubsub(&mut subscriber_state);
+    }
+
+    #[test]
+    fn subscriber_mode_rejects_storage_commands_until_unsubscribe() {
+        let mut txn_state = TransactionState::new();
+        let mut client_state = ClientState::new();
+        let channel = Bytes::from(format!("phase9:reject:{}", client_state.id));
+
+        let _ = run(
+            Command::new(OpCode::Subscribe, Vec::new(), None, vec![channel.clone()]),
+            &mut txn_state,
+            &mut client_state,
+        );
+        let rejected = run(
+            data_command(OpCode::Get, &[b"k"], None),
+            &mut txn_state,
+            &mut client_state,
+        );
+        assert!(String::from_utf8(rejected)
+            .unwrap()
+            .contains("allowed in subscriber mode"));
+
+        let _ = run(
+            Command::new(OpCode::Unsubscribe, Vec::new(), None, vec![channel.clone()]),
+            &mut txn_state,
+            &mut client_state,
+        );
+        let backend = run(
+            data_command(OpCode::Get, &[b"k"], None),
+            &mut txn_state,
+            &mut client_state,
+        );
+        assert_eq!(backend, b"-ERR backend\r\n");
+    }
+
+    #[test]
+    fn pubsub_introspection_reports_live_channels_and_patterns() {
+        let mut txn_state = TransactionState::new();
+        let mut client_state = ClientState::new();
+        let channel = Bytes::from(format!("phase9:introspect:{}", client_state.id));
+        let pattern = Bytes::from_static(b"phase9:introspect:*");
+
+        let _ = run(
+            Command::new(OpCode::Subscribe, Vec::new(), None, vec![channel.clone()]),
+            &mut txn_state,
+            &mut client_state,
+        );
+        let _ = run(
+            Command::new(OpCode::PSubscribe, Vec::new(), None, vec![pattern.clone()]),
+            &mut txn_state,
+            &mut client_state,
+        );
+
+        let mut viewer_txn = TransactionState::new();
+        let mut viewer_state = ClientState::new();
+        let channels = run(
+            Command::new(
+                OpCode::PubSub,
+                Vec::new(),
+                None,
+                vec![
+                    Bytes::from_static(b"CHANNELS"),
+                    Bytes::from_static(b"phase9:introspect:*"),
+                ],
+            ),
+            &mut viewer_txn,
+            &mut viewer_state,
+        );
+        let numsub = run(
+            Command::new(
+                OpCode::PubSub,
+                Vec::new(),
+                None,
+                vec![Bytes::from_static(b"NUMSUB"), channel.clone()],
+            ),
+            &mut viewer_txn,
+            &mut viewer_state,
+        );
+        let numpat = run(
+            Command::new(
+                OpCode::PubSub,
+                Vec::new(),
+                None,
+                vec![Bytes::from_static(b"NUMPAT")],
+            ),
+            &mut viewer_txn,
+            &mut viewer_state,
+        );
+
+        let channels_text = String::from_utf8(channels).unwrap();
+        assert!(channels_text.contains(&String::from_utf8_lossy(&channel).to_string()));
+        assert_eq!(
+            numsub,
+            format!(
+                "*2\r\n${}\r\n{}\r\n:1\r\n",
+                channel.len(),
+                String::from_utf8_lossy(&channel)
+            )
+            .into_bytes()
+        );
+        assert!(String::from_utf8(numpat).unwrap().starts_with(":"));
+
+        unregister_all_pubsub(&mut client_state);
+    }
+
+    #[test]
+    fn publish_inside_multi_delivers_at_exec() {
+        let mut subscriber_txn = TransactionState::new();
+        let mut subscriber_state = ClientState::new();
+        let channel = Bytes::from(format!("phase9:multi:{}", subscriber_state.id));
+
+        let _ = run(
+            Command::new(OpCode::Subscribe, Vec::new(), None, vec![channel.clone()]),
+            &mut subscriber_txn,
+            &mut subscriber_state,
+        );
+
+        let mut publisher_txn = TransactionState::new();
+        let mut publisher_state = ClientState::new();
+        assert_eq!(
+            run(
+                command(OpCode::Multi, &[]),
+                &mut publisher_txn,
+                &mut publisher_state
+            ),
+            b"+OK\r\n"
+        );
+        assert_eq!(
+            run(
+                Command::new(
+                    OpCode::Publish,
+                    vec![channel.clone()],
+                    Some(Bytes::from_static(b"queued")),
+                    vec![channel.clone(), Bytes::from_static(b"queued")],
+                ),
+                &mut publisher_txn,
+                &mut publisher_state,
+            ),
+            b"+QUEUED\r\n"
+        );
+        assert!(subscriber_state.pubsub_queue.lock().unwrap().is_empty());
+
+        let exec = run(
+            command(OpCode::Exec, &[]),
+            &mut publisher_txn,
+            &mut publisher_state,
+        );
+        assert_eq!(exec, b"*1\r\n:1\r\n");
+        assert!(subscriber_state
+            .pubsub_queue
+            .lock()
+            .unwrap()
+            .pop_front()
+            .is_some());
+
+        unregister_all_pubsub(&mut subscriber_state);
     }
 
     #[test]

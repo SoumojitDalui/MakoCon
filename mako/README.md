@@ -126,12 +126,12 @@ The system uses a hybrid Rust-C++ architecture:
 - WATCH doesn't actually monitor key changes (returns OK for compatibility)
 
 ### Other Unsupported Features
-- **Pub/Sub** - Requires persistent connection state and message broadcasting
 - **Lua Scripting** - Would need embedded Lua interpreter
 - **Clustering** - Single-node implementation only
 - **Persistence** - In-memory only (no RDB/AOF)
 - **Replication** - No master-slave support
 - **Streams** - Complex data structure not implemented
 - **Modules** - No plugin system
-- **Advanced Set Operations** - SUNION, SINTERSTORE, etc.
-- **Sorted Sets** - ZADD, ZRANGE, etc. not implemented
+
+See `docs/redis_interface.md` in the parent repository for the current
+command-by-command Redis compatibility surface.
