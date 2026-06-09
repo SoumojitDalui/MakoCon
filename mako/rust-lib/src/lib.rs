@@ -59,6 +59,15 @@ const TXN_OP_LTRIM: u32 = 32;
 const TXN_OP_LINSERT: u32 = 33;
 const TXN_OP_LMOVE: u32 = 34;
 const TXN_OP_LPOS: u32 = 35;
+const TXN_OP_ZADD: u32 = 36;
+const TXN_OP_ZSCORE: u32 = 37;
+const TXN_OP_ZREM: u32 = 38;
+const TXN_OP_ZCARD: u32 = 39;
+const TXN_OP_ZRANGE: u32 = 40;
+const TXN_OP_ZRANK: u32 = 41;
+const TXN_OP_ZPOPMIN: u32 = 42;
+const TXN_OP_ZCOUNT: u32 = 43;
+const TXN_OP_ZSCAN: u32 = 44;
 
 const TXN_FLAG_SET_NX: u32 = 1 << 0;
 const TXN_FLAG_SET_XX: u32 = 1 << 1;
@@ -82,6 +91,16 @@ const TXN_FLAG_LIST_INSERT_BEFORE: u32 = 1 << 18;
 const TXN_FLAG_LIST_SOURCE_LEFT: u32 = 1 << 19;
 const TXN_FLAG_LIST_DEST_LEFT: u32 = 1 << 20;
 const TXN_FLAG_LIST_COUNT_GIVEN: u32 = 1 << 21;
+const TXN_FLAG_ZADD_NX: u32 = 1 << 22;
+const TXN_FLAG_ZADD_XX: u32 = 1 << 23;
+const TXN_FLAG_ZADD_CH: u32 = 1 << 24;
+const TXN_FLAG_ZADD_INCR: u32 = 1 << 25;
+const TXN_FLAG_ZADD_GT: u32 = 1 << 26;
+const TXN_FLAG_ZADD_LT: u32 = 1 << 27;
+const TXN_FLAG_Z_WITHSCORES: u32 = 1 << 28;
+const TXN_FLAG_Z_REV: u32 = 1 << 29;
+const TXN_FLAG_Z_BYSCORE: u32 = 1 << 30;
+const TXN_FLAG_Z_COUNT_GIVEN: u32 = 1 << 31;
 
 #[repr(C)]
 struct TxnOperation {
@@ -244,6 +263,20 @@ enum OpCode {
     LMove = 71,
     RPopLPush = 72,
     LPos = 73,
+    ZAdd = 74,
+    ZScore = 75,
+    ZIncrBy = 76,
+    ZRem = 77,
+    ZCard = 78,
+    ZRange = 79,
+    ZRevRange = 80,
+    ZRangeByScore = 81,
+    ZRank = 82,
+    ZRevRank = 83,
+    ZCount = 84,
+    ZPopMin = 85,
+    ZPopMax = 86,
+    ZScan = 87,
 }
 
 #[derive(Copy, Clone, PartialEq)]
@@ -495,6 +528,34 @@ fn parse_opcode(name: &[u8]) -> Option<OpCode> {
         Some(OpCode::RPopLPush)
     } else if ascii_eq_ci(name, b"LPOS") {
         Some(OpCode::LPos)
+    } else if ascii_eq_ci(name, b"ZADD") {
+        Some(OpCode::ZAdd)
+    } else if ascii_eq_ci(name, b"ZSCORE") {
+        Some(OpCode::ZScore)
+    } else if ascii_eq_ci(name, b"ZINCRBY") {
+        Some(OpCode::ZIncrBy)
+    } else if ascii_eq_ci(name, b"ZREM") {
+        Some(OpCode::ZRem)
+    } else if ascii_eq_ci(name, b"ZCARD") {
+        Some(OpCode::ZCard)
+    } else if ascii_eq_ci(name, b"ZRANGE") {
+        Some(OpCode::ZRange)
+    } else if ascii_eq_ci(name, b"ZREVRANGE") {
+        Some(OpCode::ZRevRange)
+    } else if ascii_eq_ci(name, b"ZRANGEBYSCORE") {
+        Some(OpCode::ZRangeByScore)
+    } else if ascii_eq_ci(name, b"ZRANK") {
+        Some(OpCode::ZRank)
+    } else if ascii_eq_ci(name, b"ZREVRANK") {
+        Some(OpCode::ZRevRank)
+    } else if ascii_eq_ci(name, b"ZCOUNT") {
+        Some(OpCode::ZCount)
+    } else if ascii_eq_ci(name, b"ZPOPMIN") {
+        Some(OpCode::ZPopMin)
+    } else if ascii_eq_ci(name, b"ZPOPMAX") {
+        Some(OpCode::ZPopMax)
+    } else if ascii_eq_ci(name, b"ZSCAN") {
+        Some(OpCode::ZScan)
     } else if ascii_eq_ci(name, b"DEL") {
         Some(OpCode::Del)
     } else if ascii_eq_ci(name, b"UNLINK") {
@@ -673,6 +734,39 @@ fn parse_i64_arg(arg: &[u8]) -> Result<i64, ParseError> {
     let text = std::str::from_utf8(arg).map_err(|_| ParseError::Protocol("invalid argument"))?;
     text.parse()
         .map_err(|_| ParseError::Protocol("invalid argument"))
+}
+
+fn parse_f64_arg(arg: &[u8]) -> Result<f64, ParseError> {
+    let text = std::str::from_utf8(arg).map_err(|_| ParseError::Protocol("invalid argument"))?;
+    let value: f64 = text
+        .parse()
+        .map_err(|_| ParseError::Protocol("invalid argument"))?;
+    if value.is_nan() {
+        Err(ParseError::Protocol("invalid argument"))
+    } else {
+        Ok(value)
+    }
+}
+
+fn parse_zadd_score_arg(arg: &[u8]) -> Result<(), ParseError> {
+    let value = parse_f64_arg(arg)?;
+    if value.is_finite() {
+        Ok(())
+    } else {
+        Err(ParseError::Protocol("invalid argument"))
+    }
+}
+
+fn parse_zrange_bound_arg(arg: &[u8]) -> Result<(), ParseError> {
+    let raw = if arg.first() == Some(&b'(') {
+        &arg[1..]
+    } else {
+        arg
+    };
+    if ascii_eq_ci(raw, b"-inf") || ascii_eq_ci(raw, b"+inf") || ascii_eq_ci(raw, b"inf") {
+        return Ok(());
+    }
+    parse_f64_arg(raw).map(|_| ())
 }
 
 fn parse_list_side(arg: &[u8]) -> Result<bool, ParseError> {
@@ -1595,6 +1689,281 @@ fn parse_resp3(frame: DecodedFrame<BytesFrame>) -> Result<Command, ParseError> {
                 command_args(&parts).ok_or(ParseError::Protocol("invalid argument"))?,
             ))
         }
+        OpCode::ZAdd => {
+            if parts.len() < 4 {
+                return Err(wrong_arity("zadd"));
+            }
+            let key = part_to_bytes(&parts[1])?;
+            validate_user_key(&key)?;
+            let mut flags = 0u32;
+            let mut index = 2usize;
+            while index < parts.len() {
+                let arg = part_to_bytes(&parts[index])?;
+                if ascii_eq_ci(arg.as_ref(), b"NX") {
+                    flags |= TXN_FLAG_ZADD_NX;
+                } else if ascii_eq_ci(arg.as_ref(), b"XX") {
+                    flags |= TXN_FLAG_ZADD_XX;
+                } else if ascii_eq_ci(arg.as_ref(), b"CH") {
+                    flags |= TXN_FLAG_ZADD_CH;
+                } else if ascii_eq_ci(arg.as_ref(), b"INCR") {
+                    flags |= TXN_FLAG_ZADD_INCR;
+                } else if ascii_eq_ci(arg.as_ref(), b"GT") {
+                    flags |= TXN_FLAG_ZADD_GT;
+                } else if ascii_eq_ci(arg.as_ref(), b"LT") {
+                    flags |= TXN_FLAG_ZADD_LT;
+                } else {
+                    break;
+                }
+                index += 1;
+            }
+            if (flags & TXN_FLAG_ZADD_NX) != 0
+                && (flags & (TXN_FLAG_ZADD_XX | TXN_FLAG_ZADD_GT | TXN_FLAG_ZADD_LT)) != 0
+            {
+                return Err(ParseError::Protocol("syntax error"));
+            }
+            if (flags & TXN_FLAG_ZADD_GT) != 0 && (flags & TXN_FLAG_ZADD_LT) != 0 {
+                return Err(ParseError::Protocol("syntax error"));
+            }
+            if index >= parts.len() || (parts.len() - index) % 2 != 0 {
+                return Err(wrong_arity("zadd"));
+            }
+            if (flags & TXN_FLAG_ZADD_INCR) != 0 && parts.len() - index != 2 {
+                return Err(ParseError::Protocol("syntax error"));
+            }
+            let mut values = Vec::with_capacity(parts.len() - index);
+            for pair in parts[index..].chunks_exact(2) {
+                let score = part_to_bytes(&pair[0])?;
+                parse_zadd_score_arg(score.as_ref())?;
+                values.push(score);
+                values.push(part_to_bytes(&pair[1])?);
+            }
+            let mut cmd = Command::new(
+                op,
+                vec![key],
+                None,
+                command_args(&parts).ok_or(ParseError::Protocol("invalid argument"))?,
+            );
+            cmd.values = values;
+            cmd.expire_flags = flags;
+            Ok(cmd)
+        }
+        OpCode::ZIncrBy => {
+            if parts.len() != 4 {
+                return Err(wrong_arity("zincrby"));
+            }
+            let key = part_to_bytes(&parts[1])?;
+            validate_user_key(&key)?;
+            let increment = part_to_bytes(&parts[2])?;
+            parse_zadd_score_arg(increment.as_ref())?;
+            let member = part_to_bytes(&parts[3])?;
+            let mut cmd = Command::new(
+                op,
+                vec![key],
+                None,
+                command_args(&parts).ok_or(ParseError::Protocol("invalid argument"))?,
+            );
+            cmd.values = vec![increment, member];
+            Ok(cmd)
+        }
+        OpCode::ZScore | OpCode::ZRank | OpCode::ZRevRank => {
+            if parts.len() != 3 {
+                return Err(wrong_arity(match op {
+                    OpCode::ZScore => "zscore",
+                    OpCode::ZRank => "zrank",
+                    OpCode::ZRevRank => "zrevrank",
+                    _ => "zop",
+                }));
+            }
+            let key = part_to_bytes(&parts[1])?;
+            validate_user_key(&key)?;
+            let member = part_to_bytes(&parts[2])?;
+            Ok(Command::new(
+                op,
+                vec![key],
+                Some(member),
+                command_args(&parts).ok_or(ParseError::Protocol("invalid argument"))?,
+            ))
+        }
+        OpCode::ZRem => {
+            if parts.len() < 3 {
+                return Err(wrong_arity("zrem"));
+            }
+            let key = part_to_bytes(&parts[1])?;
+            validate_user_key(&key)?;
+            let mut members = Vec::with_capacity(parts.len() - 2);
+            for part in parts.iter().skip(2) {
+                members.push(part_to_bytes(part)?);
+            }
+            let mut cmd = Command::new(
+                op,
+                vec![key],
+                None,
+                command_args(&parts).ok_or(ParseError::Protocol("invalid argument"))?,
+            );
+            cmd.values = members;
+            Ok(cmd)
+        }
+        OpCode::ZCard => {
+            if parts.len() != 2 {
+                return Err(wrong_arity("zcard"));
+            }
+            let key = part_to_bytes(&parts[1])?;
+            validate_user_key(&key)?;
+            Ok(Command::new(
+                op,
+                vec![key],
+                None,
+                command_args(&parts).ok_or(ParseError::Protocol("invalid argument"))?,
+            ))
+        }
+        OpCode::ZRange | OpCode::ZRevRange | OpCode::ZRangeByScore => {
+            if parts.len() < 4 {
+                return Err(wrong_arity(match op {
+                    OpCode::ZRange => "zrange",
+                    OpCode::ZRevRange => "zrevrange",
+                    OpCode::ZRangeByScore => "zrangebyscore",
+                    _ => "zrange",
+                }));
+            }
+            let key = part_to_bytes(&parts[1])?;
+            validate_user_key(&key)?;
+            let first = part_to_bytes(&parts[2])?;
+            let second = part_to_bytes(&parts[3])?;
+            let mut flags = 0u32;
+            if op == OpCode::ZRangeByScore {
+                parse_zrange_bound_arg(first.as_ref())?;
+                parse_zrange_bound_arg(second.as_ref())?;
+                flags |= TXN_FLAG_Z_BYSCORE;
+            }
+            let mut values = vec![first, second];
+            let mut index = 4usize;
+            while index < parts.len() {
+                let arg = part_to_bytes(&parts[index])?;
+                if ascii_eq_ci(arg.as_ref(), b"WITHSCORES") {
+                    flags |= TXN_FLAG_Z_WITHSCORES;
+                    index += 1;
+                } else if ascii_eq_ci(arg.as_ref(), b"REV") && op == OpCode::ZRange {
+                    flags |= TXN_FLAG_Z_REV;
+                    index += 1;
+                } else if ascii_eq_ci(arg.as_ref(), b"BYSCORE") && op == OpCode::ZRange {
+                    flags |= TXN_FLAG_Z_BYSCORE;
+                    parse_zrange_bound_arg(values[0].as_ref())?;
+                    parse_zrange_bound_arg(values[1].as_ref())?;
+                    index += 1;
+                } else if ascii_eq_ci(arg.as_ref(), b"LIMIT")
+                    && ((flags & TXN_FLAG_Z_BYSCORE) != 0 || op == OpCode::ZRangeByScore)
+                {
+                    if index + 2 >= parts.len() {
+                        return Err(ParseError::Protocol("syntax error"));
+                    }
+                    let offset = part_to_bytes(&parts[index + 1])?;
+                    let count = part_to_bytes(&parts[index + 2])?;
+                    parse_i64_arg(offset.as_ref())?;
+                    parse_i64_arg(count.as_ref())?;
+                    values.push(offset);
+                    values.push(count);
+                    index += 3;
+                } else {
+                    return Err(ParseError::Protocol("syntax error"));
+                }
+            }
+            if (flags & TXN_FLAG_Z_BYSCORE) == 0 {
+                parse_i64_arg(values[0].as_ref())?;
+                parse_i64_arg(values[1].as_ref())?;
+            }
+            let mut cmd = Command::new(
+                op,
+                vec![key],
+                None,
+                command_args(&parts).ok_or(ParseError::Protocol("invalid argument"))?,
+            );
+            cmd.values = values;
+            cmd.expire_flags = flags;
+            Ok(cmd)
+        }
+        OpCode::ZCount => {
+            if parts.len() != 4 {
+                return Err(wrong_arity("zcount"));
+            }
+            let key = part_to_bytes(&parts[1])?;
+            validate_user_key(&key)?;
+            let min = part_to_bytes(&parts[2])?;
+            let max = part_to_bytes(&parts[3])?;
+            parse_zrange_bound_arg(min.as_ref())?;
+            parse_zrange_bound_arg(max.as_ref())?;
+            let mut cmd = Command::new(
+                op,
+                vec![key],
+                None,
+                command_args(&parts).ok_or(ParseError::Protocol("invalid argument"))?,
+            );
+            cmd.values = vec![min, max];
+            Ok(cmd)
+        }
+        OpCode::ZPopMin | OpCode::ZPopMax => {
+            if parts.len() < 2 || parts.len() > 3 {
+                return Err(wrong_arity(if op == OpCode::ZPopMin {
+                    "zpopmin"
+                } else {
+                    "zpopmax"
+                }));
+            }
+            let key = part_to_bytes(&parts[1])?;
+            validate_user_key(&key)?;
+            let mut cmd = Command::new(
+                op,
+                vec![key],
+                None,
+                command_args(&parts).ok_or(ParseError::Protocol("invalid argument"))?,
+            );
+            if parts.len() == 3 {
+                let count = parse_i64_arg(part_to_bytes(&parts[2])?.as_ref())?;
+                if count < 0 {
+                    return Err(ParseError::Protocol("value is out of range"));
+                }
+                cmd.set_count = Some(count);
+            }
+            Ok(cmd)
+        }
+        OpCode::ZScan => {
+            if parts.len() < 3 {
+                return Err(wrong_arity("zscan"));
+            }
+            let key = part_to_bytes(&parts[1])?;
+            validate_user_key(&key)?;
+            let cursor = part_to_bytes(&parts[2])?;
+            if cursor.as_ref() != b"0" {
+                return Err(ParseError::Protocol("invalid cursor"));
+            }
+            let mut cmd = Command::new(
+                op,
+                vec![key],
+                None,
+                command_args(&parts).ok_or(ParseError::Protocol("invalid argument"))?,
+            );
+            cmd.scan_count = 10;
+            let mut index = 3usize;
+            while index < parts.len() {
+                let arg = part_to_bytes(&parts[index])?;
+                if ascii_eq_ci(arg.as_ref(), b"MATCH") {
+                    if index + 1 >= parts.len() {
+                        return Err(ParseError::Protocol("syntax error"));
+                    }
+                    cmd.scan_prefix = part_to_bytes(&parts[index + 1])?;
+                    index += 2;
+                } else if ascii_eq_ci(arg.as_ref(), b"COUNT") {
+                    if index + 1 >= parts.len() {
+                        return Err(ParseError::Protocol("syntax error"));
+                    }
+                    cmd.scan_count =
+                        parse_positive_i64(part_to_bytes(&parts[index + 1])?.as_ref())?;
+                    index += 2;
+                } else {
+                    return Err(ParseError::Protocol("syntax error"));
+                }
+            }
+            Ok(cmd)
+        }
         OpCode::Ping
         | OpCode::Multi
         | OpCode::Exec
@@ -2401,6 +2770,176 @@ fn build_txn_ops(commands: &[Command]) -> (Vec<TxnOperation>, Vec<(usize, usize)
                     group_id: 0,
                 });
             }
+            OpCode::ZAdd | OpCode::ZIncrBy => {
+                let Some(key) = cmd.keys.first() else {
+                    spans.push((start, 0));
+                    continue;
+                };
+                let payload = pack_bytes_list(&cmd.values);
+                payloads.push(payload);
+                let payload = payloads.last().unwrap();
+                let mut flags = cmd.expire_flags;
+                if cmd.op == OpCode::ZIncrBy {
+                    flags |= TXN_FLAG_ZADD_INCR;
+                }
+                ops.push(TxnOperation {
+                    op: TXN_OP_ZADD,
+                    key_ptr: key.as_ptr(),
+                    key_len: key.len(),
+                    val_ptr: payload.as_ptr(),
+                    val_len: payload.len(),
+                    flags,
+                    expire_at_ms: -1,
+                    group_id: 0,
+                });
+            }
+            OpCode::ZScore | OpCode::ZRank | OpCode::ZRevRank => {
+                let Some(key) = cmd.keys.first() else {
+                    spans.push((start, 0));
+                    continue;
+                };
+                let Some(member) = cmd.val.as_ref() else {
+                    spans.push((start, 0));
+                    continue;
+                };
+                let flags = if cmd.op == OpCode::ZRevRank {
+                    TXN_FLAG_Z_REV
+                } else {
+                    0
+                };
+                ops.push(TxnOperation {
+                    op: if cmd.op == OpCode::ZScore {
+                        TXN_OP_ZSCORE
+                    } else {
+                        TXN_OP_ZRANK
+                    },
+                    key_ptr: key.as_ptr(),
+                    key_len: key.len(),
+                    val_ptr: member.as_ptr(),
+                    val_len: member.len(),
+                    flags,
+                    expire_at_ms: -1,
+                    group_id: 0,
+                });
+            }
+            OpCode::ZRem => {
+                let Some(key) = cmd.keys.first() else {
+                    spans.push((start, 0));
+                    continue;
+                };
+                let payload = pack_bytes_list(&cmd.values);
+                payloads.push(payload);
+                let payload = payloads.last().unwrap();
+                ops.push(TxnOperation {
+                    op: TXN_OP_ZREM,
+                    key_ptr: key.as_ptr(),
+                    key_len: key.len(),
+                    val_ptr: payload.as_ptr(),
+                    val_len: payload.len(),
+                    flags: 0,
+                    expire_at_ms: -1,
+                    group_id: 0,
+                });
+            }
+            OpCode::ZCard => {
+                let Some(key) = cmd.keys.first() else {
+                    spans.push((start, 0));
+                    continue;
+                };
+                ops.push(TxnOperation {
+                    op: TXN_OP_ZCARD,
+                    key_ptr: key.as_ptr(),
+                    key_len: key.len(),
+                    val_ptr: std::ptr::null(),
+                    val_len: 0,
+                    flags: 0,
+                    expire_at_ms: -1,
+                    group_id: 0,
+                });
+            }
+            OpCode::ZRange | OpCode::ZRevRange | OpCode::ZRangeByScore => {
+                let Some(key) = cmd.keys.first() else {
+                    spans.push((start, 0));
+                    continue;
+                };
+                let payload = pack_bytes_list(&cmd.values);
+                payloads.push(payload);
+                let payload = payloads.last().unwrap();
+                let mut flags = cmd.expire_flags;
+                if cmd.op == OpCode::ZRevRange {
+                    flags |= TXN_FLAG_Z_REV;
+                } else if cmd.op == OpCode::ZRangeByScore {
+                    flags |= TXN_FLAG_Z_BYSCORE;
+                }
+                ops.push(TxnOperation {
+                    op: TXN_OP_ZRANGE,
+                    key_ptr: key.as_ptr(),
+                    key_len: key.len(),
+                    val_ptr: payload.as_ptr(),
+                    val_len: payload.len(),
+                    flags,
+                    expire_at_ms: -1,
+                    group_id: 0,
+                });
+            }
+            OpCode::ZCount => {
+                let Some(key) = cmd.keys.first() else {
+                    spans.push((start, 0));
+                    continue;
+                };
+                let payload = pack_bytes_list(&cmd.values);
+                payloads.push(payload);
+                let payload = payloads.last().unwrap();
+                ops.push(TxnOperation {
+                    op: TXN_OP_ZCOUNT,
+                    key_ptr: key.as_ptr(),
+                    key_len: key.len(),
+                    val_ptr: payload.as_ptr(),
+                    val_len: payload.len(),
+                    flags: 0,
+                    expire_at_ms: -1,
+                    group_id: 0,
+                });
+            }
+            OpCode::ZPopMin | OpCode::ZPopMax => {
+                let Some(key) = cmd.keys.first() else {
+                    spans.push((start, 0));
+                    continue;
+                };
+                let mut flags = 0;
+                if cmd.op == OpCode::ZPopMax {
+                    flags |= TXN_FLAG_Z_REV;
+                }
+                if cmd.set_count.is_some() {
+                    flags |= TXN_FLAG_Z_COUNT_GIVEN;
+                }
+                ops.push(TxnOperation {
+                    op: TXN_OP_ZPOPMIN,
+                    key_ptr: key.as_ptr(),
+                    key_len: key.len(),
+                    val_ptr: std::ptr::null(),
+                    val_len: 0,
+                    flags,
+                    expire_at_ms: cmd.set_count.unwrap_or(1),
+                    group_id: 0,
+                });
+            }
+            OpCode::ZScan => {
+                let Some(key) = cmd.keys.first() else {
+                    spans.push((start, 0));
+                    continue;
+                };
+                ops.push(TxnOperation {
+                    op: TXN_OP_ZSCAN,
+                    key_ptr: key.as_ptr(),
+                    key_len: key.len(),
+                    val_ptr: cmd.scan_prefix.as_ptr(),
+                    val_len: cmd.scan_prefix.len(),
+                    flags: 0,
+                    expire_at_ms: cmd.scan_count,
+                    group_id: 0,
+                });
+            }
             _ => {}
         }
         spans.push((start, ops.len() - start));
@@ -2462,6 +3001,20 @@ fn command_needs_retry(cmd: &Command) -> bool {
             | OpCode::LMove
             | OpCode::RPopLPush
             | OpCode::LPos
+            | OpCode::ZAdd
+            | OpCode::ZScore
+            | OpCode::ZIncrBy
+            | OpCode::ZRem
+            | OpCode::ZCard
+            | OpCode::ZRange
+            | OpCode::ZRevRange
+            | OpCode::ZRangeByScore
+            | OpCode::ZRank
+            | OpCode::ZRevRank
+            | OpCode::ZCount
+            | OpCode::ZPopMin
+            | OpCode::ZPopMax
+            | OpCode::ZScan
     )
 }
 
@@ -2772,6 +3325,7 @@ fn write_command_result<W: Write>(
                     1 => write_simple_string(writer, "string")?,
                     2 => write_simple_string(writer, "set")?,
                     3 => write_simple_string(writer, "list")?,
+                    4 => write_simple_string(writer, "zset")?,
                     _ => write_simple_string(writer, "none")?,
                 }
             } else {
@@ -2984,6 +3538,101 @@ fn write_command_result<W: Write>(
                 write_integer(writer, first.int_value)?;
             } else {
                 write_nil_bulk(writer)?;
+            }
+        }
+        OpCode::ZAdd => {
+            if !first.success {
+                write_err(writer, "operation failed")?;
+            } else if (cmd.expire_flags & TXN_FLAG_ZADD_INCR) != 0 {
+                if first.value_present {
+                    if first.data_len > 0 {
+                        if first.data_ptr.is_null() {
+                            write_err(writer, "operation failed")?;
+                        } else {
+                            let data = unsafe {
+                                std::slice::from_raw_parts(first.data_ptr, first.data_len)
+                            };
+                            write_bulk(writer, data)?;
+                        }
+                    } else {
+                        write_bulk(writer, b"")?;
+                    }
+                } else {
+                    write_nil_bulk(writer)?;
+                }
+            } else {
+                write_integer(writer, first.int_value)?;
+            }
+        }
+        OpCode::ZIncrBy | OpCode::ZScore => {
+            if !first.success {
+                write_err(writer, "operation failed")?;
+            } else if first.value_present {
+                if first.data_len > 0 {
+                    if first.data_ptr.is_null() {
+                        write_err(writer, "operation failed")?;
+                    } else {
+                        let data =
+                            unsafe { std::slice::from_raw_parts(first.data_ptr, first.data_len) };
+                        write_bulk(writer, data)?;
+                    }
+                } else {
+                    write_bulk(writer, b"")?;
+                }
+            } else {
+                write_nil_bulk(writer)?;
+            }
+        }
+        OpCode::ZRem | OpCode::ZCard | OpCode::ZCount => {
+            if first.success {
+                write_integer(writer, first.int_value)?;
+            } else {
+                write_err(writer, "operation failed")?;
+            }
+        }
+        OpCode::ZRank | OpCode::ZRevRank => {
+            if !first.success {
+                write_err(writer, "operation failed")?;
+            } else if first.value_present {
+                write_integer(writer, first.int_value)?;
+            } else {
+                write_nil_bulk(writer)?;
+            }
+        }
+        OpCode::ZRange
+        | OpCode::ZRevRange
+        | OpCode::ZRangeByScore
+        | OpCode::ZPopMin
+        | OpCode::ZPopMax => {
+            if !first.success || !first.value_present || first.data_ptr.is_null() {
+                write_err(writer, "operation failed")?;
+            } else {
+                let data = unsafe { std::slice::from_raw_parts(first.data_ptr, first.data_len) };
+                if let Some(items) = parse_list_payload(data) {
+                    write_array_header(writer, items.len())?;
+                    for item in items {
+                        write_bulk(writer, &item)?;
+                    }
+                } else {
+                    write_err(writer, "operation failed")?;
+                }
+            }
+        }
+        OpCode::ZScan => {
+            if !first.success || !first.value_present || first.data_ptr.is_null() {
+                write_err(writer, "operation failed")?;
+            } else {
+                let data = unsafe { std::slice::from_raw_parts(first.data_ptr, first.data_len) };
+                if let Some(items) = parse_list_payload(data) {
+                    write_array_header(writer, 2)?;
+                    write_bulk(writer, b"0")?;
+                    write_array_header(writer, items.len())?;
+                    for item in items {
+                        write_bulk(writer, &item)?;
+                    }
+                } else {
+                    write_err(writer, "operation failed")?;
+                }
             }
         }
         _ => write_err(writer, "operation failed")?,
@@ -3693,7 +4342,21 @@ fn handle_command<W: Write>(
         | OpCode::RPushX
         | OpCode::LMove
         | OpCode::RPopLPush
-        | OpCode::LPos => {
+        | OpCode::LPos
+        | OpCode::ZAdd
+        | OpCode::ZScore
+        | OpCode::ZIncrBy
+        | OpCode::ZRem
+        | OpCode::ZCard
+        | OpCode::ZRange
+        | OpCode::ZRevRange
+        | OpCode::ZRangeByScore
+        | OpCode::ZRank
+        | OpCode::ZRevRank
+        | OpCode::ZCount
+        | OpCode::ZPopMin
+        | OpCode::ZPopMax
+        | OpCode::ZScan => {
             if txn_state.in_multi {
                 // Queue command for later execution
                 txn_state.queue_command(cmd.clone());
