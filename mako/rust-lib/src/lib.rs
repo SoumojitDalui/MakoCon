@@ -282,6 +282,7 @@ enum OpCode {
     PUnsubscribe = 91,
     Publish = 92,
     PubSub = 93,
+    SScan = 94,
 }
 
 #[derive(Copy, Clone, PartialEq)]
@@ -540,6 +541,8 @@ fn parse_opcode(name: &[u8]) -> Option<OpCode> {
         Some(OpCode::SRem)
     } else if ascii_eq_ci(name, b"SCARD") {
         Some(OpCode::SCard)
+    } else if ascii_eq_ci(name, b"SSCAN") {
+        Some(OpCode::SScan)
     } else if ascii_eq_ci(name, b"SMOVE") {
         Some(OpCode::SMove)
     } else if ascii_eq_ci(name, b"SPOP") {
@@ -900,6 +903,25 @@ fn store_scan_cursor(cursor: &[u8]) -> String {
     } else {
         "0".to_string()
     }
+}
+
+fn scan_offset_from_arg(arg: &[u8]) -> Result<usize, ParseError> {
+    if arg == b"0" {
+        return Ok(0);
+    }
+    let cursor = scan_cursor_from_arg(arg)?;
+    let text =
+        std::str::from_utf8(cursor.as_ref()).map_err(|_| ParseError::Protocol("invalid cursor"))?;
+    let Some(raw_offset) = text.strip_prefix("offset:") else {
+        return Err(ParseError::Protocol("invalid cursor"));
+    };
+    raw_offset
+        .parse()
+        .map_err(|_| ParseError::Protocol("invalid cursor"))
+}
+
+fn store_scan_offset(offset: usize) -> String {
+    store_scan_cursor(format!("offset:{offset}").as_bytes())
 }
 
 fn glob_class_matches(pattern: &[u8], start: usize, value: u8) -> Option<(bool, usize)> {
@@ -1444,6 +1466,44 @@ fn parse_resp3(frame: DecodedFrame<BytesFrame>) -> Result<Command, ParseError> {
                 None,
                 command_args(&parts).ok_or(ParseError::Protocol("invalid argument"))?,
             ))
+        }
+        OpCode::SScan => {
+            if parts.len() < 3 {
+                return Err(wrong_arity("sscan"));
+            }
+            let key = part_to_bytes(&parts[1])?;
+            validate_user_key(&key)?;
+            let cursor = part_to_bytes(&parts[2])?;
+            let mut cmd = Command::new(
+                op,
+                vec![key],
+                None,
+                command_args(&parts).ok_or(ParseError::Protocol("invalid argument"))?,
+            );
+            cmd.expire_at_ms = scan_offset_from_arg(cursor.as_ref())? as i64;
+            cmd.scan_count = 10;
+            cmd.scan_prefix = Bytes::from_static(b"*");
+            let mut index = 3usize;
+            while index < parts.len() {
+                let arg = part_to_bytes(&parts[index])?;
+                if ascii_eq_ci(arg.as_ref(), b"MATCH") {
+                    if index + 1 >= parts.len() {
+                        return Err(ParseError::Protocol("syntax error"));
+                    }
+                    cmd.scan_prefix = part_to_bytes(&parts[index + 1])?;
+                    index += 2;
+                } else if ascii_eq_ci(arg.as_ref(), b"COUNT") {
+                    if index + 1 >= parts.len() {
+                        return Err(ParseError::Protocol("syntax error"));
+                    }
+                    cmd.scan_count =
+                        parse_positive_i64(part_to_bytes(&parts[index + 1])?.as_ref())?;
+                    index += 2;
+                } else {
+                    return Err(ParseError::Protocol("syntax error"));
+                }
+            }
+            Ok(cmd)
         }
         OpCode::SIsMember => {
             if parts.len() != 3 {
@@ -2006,16 +2066,15 @@ fn parse_resp3(frame: DecodedFrame<BytesFrame>) -> Result<Command, ParseError> {
             let key = part_to_bytes(&parts[1])?;
             validate_user_key(&key)?;
             let cursor = part_to_bytes(&parts[2])?;
-            if cursor.as_ref() != b"0" {
-                return Err(ParseError::Protocol("invalid cursor"));
-            }
             let mut cmd = Command::new(
                 op,
                 vec![key],
                 None,
                 command_args(&parts).ok_or(ParseError::Protocol("invalid argument"))?,
             );
+            cmd.expire_at_ms = scan_offset_from_arg(cursor.as_ref())? as i64;
             cmd.scan_count = 10;
+            cmd.scan_prefix = Bytes::from_static(b"*");
             let mut index = 3usize;
             while index < parts.len() {
                 let arg = part_to_bytes(&parts[index])?;
@@ -2999,7 +3058,7 @@ fn build_txn_ops(commands: &[Command]) -> (Vec<TxnOperation>, Vec<(usize, usize)
                     group_id: 0,
                 });
             }
-            OpCode::SCard | OpCode::SMembers => {
+            OpCode::SCard | OpCode::SMembers | OpCode::SScan => {
                 let Some(key) = cmd.keys.first() else {
                     spans.push((start, 0));
                     continue;
@@ -3458,6 +3517,7 @@ fn command_needs_retry(cmd: &Command) -> bool {
             | OpCode::SIsMember
             | OpCode::SRem
             | OpCode::SCard
+            | OpCode::SScan
             | OpCode::SMove
             | OpCode::SPop
             | OpCode::SRandMember
@@ -3640,6 +3700,103 @@ fn ffi_execute_transaction<W: Write>(commands: &[Command], writer: &mut W) -> st
     unsafe { cpp_free_transaction_response(&mut response) };
 
     Ok(())
+}
+
+fn scan_page_start(cmd: &Command) -> usize {
+    if cmd.expire_at_ms <= 0 {
+        0
+    } else {
+        cmd.expire_at_ms as usize
+    }
+}
+
+fn scan_page_limit(cmd: &Command) -> usize {
+    usize::try_from(cmd.scan_count)
+        .unwrap_or(10)
+        .clamp(1, 1_000_000)
+}
+
+fn scan_page_pattern(cmd: &Command) -> &[u8] {
+    if cmd.scan_prefix.is_empty() {
+        b"*"
+    } else {
+        cmd.scan_prefix.as_ref()
+    }
+}
+
+fn write_scan_page<W: Write>(
+    writer: &mut W,
+    next_index: usize,
+    total_items: usize,
+    items: Vec<Vec<u8>>,
+) -> std::io::Result<()> {
+    write_array_header(writer, 2)?;
+    if next_index >= total_items {
+        write_bulk(writer, b"0")?;
+    } else {
+        write_bulk(writer, store_scan_offset(next_index).as_bytes())?;
+    }
+    write_array_header(writer, items.len())?;
+    for item in items {
+        write_bulk(writer, &item)?;
+    }
+    Ok(())
+}
+
+fn write_paginated_member_scan<W: Write>(
+    writer: &mut W,
+    cmd: &Command,
+    mut members: Vec<Vec<u8>>,
+) -> std::io::Result<()> {
+    members.sort();
+    let start = scan_page_start(cmd).min(members.len());
+    let limit = scan_page_limit(cmd);
+    let pattern = scan_page_pattern(cmd);
+    let mut out = Vec::new();
+    let mut next_index = start;
+
+    for (index, member) in members.iter().enumerate().skip(start) {
+        next_index = index + 1;
+        if glob_matches(pattern, member) {
+            out.push(member.clone());
+            if out.len() >= limit {
+                break;
+            }
+        }
+    }
+
+    write_scan_page(writer, next_index, members.len(), out)
+}
+
+fn write_paginated_zscan<W: Write>(
+    writer: &mut W,
+    cmd: &Command,
+    items: Vec<Vec<u8>>,
+) -> std::io::Result<()> {
+    if items.len() % 2 != 0 {
+        write_err(writer, "operation failed")?;
+        return Ok(());
+    }
+    let total_members = items.len() / 2;
+    let start = scan_page_start(cmd).min(total_members);
+    let limit = scan_page_limit(cmd);
+    let pattern = scan_page_pattern(cmd);
+    let mut out = Vec::new();
+    let mut next_member_index = start;
+
+    for member_index in start..total_members {
+        next_member_index = member_index + 1;
+        let member = &items[member_index * 2];
+        if glob_matches(pattern, member) {
+            out.push(member.clone());
+            out.push(items[member_index * 2 + 1].clone());
+            if out.len() / 2 >= limit {
+                break;
+            }
+        }
+    }
+
+    write_scan_page(writer, next_member_index, total_members, out)
 }
 
 fn write_command_result<W: Write>(
@@ -3898,6 +4055,18 @@ fn write_command_result<W: Write>(
                 }
             }
         }
+        OpCode::SScan => {
+            if !first.success || !first.value_present || first.data_ptr.is_null() {
+                write_err(writer, "operation failed")?;
+            } else {
+                let data = unsafe { std::slice::from_raw_parts(first.data_ptr, first.data_len) };
+                if let Some(items) = parse_list_payload(data) {
+                    write_paginated_member_scan(writer, cmd, items)?;
+                } else {
+                    write_err(writer, "operation failed")?;
+                }
+            }
+        }
         OpCode::SInterStore | OpCode::SUnionStore | OpCode::SDiffStore => {
             if first.success {
                 write_integer(writer, first.int_value)?;
@@ -4110,12 +4279,7 @@ fn write_command_result<W: Write>(
             } else {
                 let data = unsafe { std::slice::from_raw_parts(first.data_ptr, first.data_len) };
                 if let Some(items) = parse_list_payload(data) {
-                    write_array_header(writer, 2)?;
-                    write_bulk(writer, b"0")?;
-                    write_array_header(writer, items.len())?;
-                    for item in items {
-                        write_bulk(writer, &item)?;
-                    }
+                    write_paginated_zscan(writer, cmd, items)?;
                 } else {
                     write_err(writer, "operation failed")?;
                 }
@@ -4909,6 +5073,7 @@ fn handle_command<W: Write>(
         | OpCode::SIsMember
         | OpCode::SRem
         | OpCode::SCard
+        | OpCode::SScan
         | OpCode::SMove
         | OpCode::SPop
         | OpCode::SRandMember
